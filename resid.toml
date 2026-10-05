@@ -1,6 +1,9 @@
 [package]
 name = "resid-datastar"
 version = "0.1.0"
+description = "A Datastar server SDK for Resid, and a live web UI for package registries"
+license = "MIT"
+repository = "https://github.com/larrydewey/resid-datastar"
 
 # The SDK is pure: no capabilities. The registry UI (ui/registry.resid)
 # grants itself what it uses from its own main: args, filesystem (the

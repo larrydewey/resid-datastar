@@ -180,3 +180,9 @@ Checkouts of [resid-json](https://github.com/larrydewey/resid-json),
 To move to a newer Datastar, replace `assets/datastar.js` and
 `assets/DATASTAR-LICENSE.md`, run `tools/embed_client.py`, and update the
 version in the tests.
+
+## Licence
+
+MIT, in `LICENSE`. The vendored Datastar client (`assets/datastar.js`,
+embedded in `src/client.resid`) and its SDK test cases (`tests/spec`) are
+Star Federation's, also MIT, in `assets/DATASTAR-LICENSE.md`.
