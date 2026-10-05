@@ -1,0 +1,582 @@
+// ─── ui/registry.resid — a web UI for a resid registry ─────────────────
+// Browse a registry directory (the layout `resid-pkg publish` writes:
+// pkg/<name>-<version>.resid-pkg, -sha256, -sig, and the signed
+// index.resid-idx / index.resid-sig) in a browser, driven by Datastar:
+//
+//   /                          packages, searched as you type
+//   /pkg/<name>                its versions; each one's hash, signature
+//                              and files, any file shown in place
+//   /download/<name>/<ver>     the archive
+//
+// Pages stay live: each opens a stream that watches the registry and has
+// the page fetch what changed, so a publish shows up without a reload.
+//
+//   resid-registry-ui <registry> [--port N] [--port-file F] [--pubkey HEX]
+//                     [--cdn] [--poll-ms N] [--requests N]
+//
+// With --pubkey the index and every archive signature are verified
+// against that key; without it they are only reported present. The
+// server binds 127.0.0.1, reads the registry and never writes it.
+
+import "../src/datastar.resid";
+import "crypto.resid";
+import "ed25519.resid";
+
+type Opts = { Str root; Int port; Str port_file; Str pubkey; Bool cdn; Int poll_ms; Int requests; Bool ok; };
+
+// ─── Reading the registry ───────────────────────────────────────────────
+
+// One archive. `indexed` when the signed index lists it; `recorded` is
+// the hash the index (else the -sha256 file) gives.
+type Entry = { Str name; Str version; Str recorded; Bool indexed; };
+
+// The index: absent, present but not checked (no key), verified, or bad.
+type IndexState = { Bool present; Str status; Int listed; };
+
+type Registry = { List(Entry) entries; IndexState index; Str fingerprint; };
+
+// A name or version safe in a path and in markup: letters, digits, . _ - +
+Bool safe_word(Str s) {
+    if (str_len(s) == 0 || str_len(s) > 128 || s == "." || s == "..") { return false; }
+    return safe_at(s, 0);
+}
+
+Bool safe_at(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    Bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 46 || c == 95 || c == 45 || c == 43;
+    if (!ok) { return false; }
+    return safe_at(s, i + 1);
+}
+
+// `<name> <version> <sha256>` lines; comments and blanks skipped.
+List(Entry) parse_index(Str text) { return index_lines(str_split(text, "\n"), 0, ListBuf()); }
+
+List(Entry) index_lines(List(Str) ls, Int i, ListBuf(Entry) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    Str t = str_trim(ls[i]);
+    List(Str) ws = words(t);
+    Bool take = !str_starts_with(t, "#") && ws.len() == 3 && safe_word(ws[0]) && safe_word(ws[1]);
+    ListBuf(Entry) next = if (take) { acc.push(Entry { .name = ws[0], .version = ws[1], .recorded = ws[2], .indexed = true }) } else { acc };
+    return index_lines(ls, i + 1, next);
+}
+
+List(Str) words(Str s) { return keep_nonempty(str_split(str_replace(s, "\t", " "), " "), 0, ListBuf()); }
+
+List(Str) keep_nonempty(List(Str) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    ListBuf(Str) next = if (xs[i] == "") { acc } else { acc.push(xs[i]) };
+    return keep_nonempty(xs, i + 1, next);
+}
+
+// "foo-bar-1.2.0.resid-pkg" is foo-bar 1.2.0: the version starts after
+// the last "-" followed by a digit.
+Option(Entry) archive_entry(Str file) {
+    if (!str_ends_with(file, ".resid-pkg")) { return None; }
+    Str base = str_slice(file, 0, str_len(file) - 10);
+    Int cut = version_cut(base, str_len(base) - 2);
+    if (cut <= 0) { return None; }
+    Str name = str_slice(base, 0, cut);
+    Str version = str_slice(base, cut + 1, str_len(base));
+    if (!safe_word(name) || !safe_word(version)) { return None; }
+    return Some(Entry { .name = name, .version = version, .recorded = "", .indexed = false });
+}
+
+Int version_cut(Str s, Int i) {
+    if (i < 0) { return -1; }
+    Int d = str_char_at(s, i + 1);
+    if (str_char_at(s, i) == 45 && d >= 48 && d <= 57) { return i; }
+    return version_cut(s, i - 1);
+}
+
+Str pkg_base(Str root, Str name, Str version) { return root + "/pkg/" + name + "-" + version + ".resid"; }
+
+@requires(filesystem(readonly))
+Str read_text(Str path) {
+    if (!filesystem.exists(path) || filesystem.is_dir(path)) { return ""; }
+    return filesystem.read_all(path);
+}
+
+@requires(filesystem(readonly))
+List(Str) pkg_files(Str root) {
+    Str dir = root + "/pkg";
+    if (!filesystem.is_dir(dir)) { return []; }
+    return sort(filesystem.list_dir(dir));
+}
+
+// What is published: the index's entries, then archives it does not list.
+@requires(filesystem(readonly))
+Registry load(Str root, Str pubkey) {
+    Str idx = read_text(root + "/pkg/index.resid-idx");
+    Str sig = str_trim(read_text(root + "/pkg/index.resid-sig"));
+    List(Entry) listed = parse_index(idx);
+    List(Str) files = pkg_files(root);
+    List(Entry) extra = unlisted(root, files, listed, 0, ListBuf());
+    Bool present = idx != "";
+    Str status = if (!present) { "absent" } else { if (sig == "") { "unsigned" } else { if (pubkey == "") { "signed" } else { if (verify_sig(hex_encode(sha256_bytes(http_bytes(idx))), hex_bytes(sig), hex_bytes(pubkey))) { "verified" } else { "bad signature" } } } };
+    IndexState st = IndexState { .present = present, .status = status, .listed = listed.len() };
+    Str fp = str_sha256(idx + "\n" + sig + "\n" + str_join(files, "\n"));
+    return Registry { .entries = sort_entries(listed.concat(extra)), .index = st, .fingerprint = fp };
+}
+
+@requires(filesystem(readonly))
+List(Entry) unlisted(Str root, List(Str) files, List(Entry) listed, Int i, ListBuf(Entry) acc) {
+    if (i >= files.len()) { return acc.finish(); }
+    Option(Entry) e = archive_entry(files[i]);
+    ListBuf(Entry) next = match e {
+        Some(x) => if (has_entry(listed, x.name, x.version, 0)) { acc } else {
+            acc.push(Entry { .name = x.name, .version = x.version, .recorded = str_trim(read_text(pkg_base(root, x.name, x.version) + "-sha256")), .indexed = false })
+        },
+        None => acc
+    };
+    return unlisted(root, files, listed, i + 1, next);
+}
+
+Bool has_entry(List(Entry) es, Str name, Str version, Int i) {
+    if (i >= es.len()) { return false; }
+    if (es[i].name == name && es[i].version == version) { return true; }
+    return has_entry(es, name, version, i + 1);
+}
+
+// The registry's fingerprint alone: what the live stream polls.
+@requires(filesystem(readonly))
+Str fingerprint(Str root) {
+    Str idx = read_text(root + "/pkg/index.resid-idx");
+    Str sig = str_trim(read_text(root + "/pkg/index.resid-sig"));
+    return str_sha256(idx + "\n" + sig + "\n" + str_join(pkg_files(root), "\n"));
+}
+
+List(Int) hex_bytes(Str s) { return hex_at(s, 0, ListBuf()); }
+
+List(Int) hex_at(Str s, Int i, ListBuf(Int) acc) {
+    if (i + 1 >= str_len(s)) { return acc.finish(); }
+    return hex_at(s, i + 2, acc.push(nibble(str_char_at(s, i)) * 16 + nibble(str_char_at(s, i + 1))));
+}
+
+Int nibble(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+// ─── Ordering ───────────────────────────────────────────────────────────
+
+// Versions compare by dotted parts, numerically where both are numbers.
+Int ver_cmp(Str a, Str b) { return ver_parts(str_split(a, "."), str_split(b, "."), 0); }
+
+Int ver_parts(List(Str) a, List(Str) b, Int i) {
+    if (i >= a.len() && i >= b.len()) { return 0; }
+    if (i >= a.len()) { return -1; }
+    if (i >= b.len()) { return 1; }
+    Bool nums = str_is_int(a[i]) && str_is_int(b[i]);
+    Int c = if (nums) { cmp_int(str_parse_int(a[i]), str_parse_int(b[i])) } else { if (a[i] < b[i]) { -1 } else { if (a[i] == b[i]) { 0 } else { 1 } } };
+    if (c != 0) { return c; }
+    return ver_parts(a, b, i + 1);
+}
+
+Int cmp_int(Int a, Int b) { return if (a < b) { -1 } else { if (a == b) { 0 } else { 1 } }; }
+
+// Name ascending, then newest version first.
+Bool entry_before(Entry a, Entry b) {
+    if (a.name != b.name) { return a.name < b.name; }
+    return ver_cmp(a.version, b.version) > 0;
+}
+
+List(Entry) sort_entries(List(Entry) es) { return insert_all(es, 0, []); }
+
+List(Entry) insert_all(List(Entry) es, Int i, List(Entry) acc) {
+    if (i >= es.len()) { return acc; }
+    return insert_all(es, i + 1, insert_one(acc, es[i], 0));
+}
+
+List(Entry) insert_one(List(Entry) acc, Entry e, Int i) {
+    if (i >= acc.len() || entry_before(e, acc[i])) { return acc[0..i].concat([e]).concat(acc[i..acc.len()]); }
+    return insert_one(acc, e, i + 1);
+}
+
+// One row per package: its newest version and how many there are.
+type Package = { Str name; Str latest; Int versions; Bool indexed; };
+
+List(Package) packages(List(Entry) es, Int i, ListBuf(Package) acc) {
+    if (i >= es.len()) { return acc.finish(); }
+    Bool first = i == 0 || es[i - 1].name != es[i].name;
+    if (!first) { return packages(es, i + 1, acc); }
+    Int n = run_len(es, es[i].name, i, 0);
+    Package p = Package { .name = es[i].name, .latest = es[i].version, .versions = n, .indexed = es[i].indexed };
+    return packages(es, i + 1, acc.push(p));
+}
+
+Int run_len(List(Entry) es, Str name, Int i, Int n) {
+    if (i >= es.len() || es[i].name != name) { return n; }
+    return run_len(es, name, i + 1, n + 1);
+}
+
+List(Package) matching(List(Package) ps, Str q, Int i, ListBuf(Package) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    Bool hit = q == "" || str_contains(str_to_lower(ps[i].name), q);
+    ListBuf(Package) next = if (hit) { acc.push(ps[i]) } else { acc };
+    return matching(ps, q, i + 1, next);
+}
+
+List(Entry) versions_of(List(Entry) es, Str name, Int i, ListBuf(Entry) acc) {
+    if (i >= es.len()) { return acc.finish(); }
+    ListBuf(Entry) next = if (es[i].name == name) { acc.push(es[i]) } else { acc };
+    return versions_of(es, name, i + 1, next);
+}
+
+// ─── Archives ───────────────────────────────────────────────────────────
+
+// RESIDPKG1, a u32 file count, then per file a u16 path length, the
+// path, a u64 content length and the content (little-endian).
+type ArchFile = { Str path; Int at; Int size; };
+
+Int le(List(Int) b, Int at, Int n) { return if (n == 0) { 0 } else { b[at] + 256 * le(b, at + 1, n - 1) }; }
+
+Bool is_archive(List(Int) b) { return b.len() >= 13 && http_text(b, 0, 9) == "RESIDPKG1"; }
+
+// The files, or none when the archive does not parse to its end.
+List(ArchFile) arch_files(List(Int) b) {
+    if (!is_archive(b)) { return []; }
+    return arch_at(b, 13, le(b, 9, 4), ListBuf());
+}
+
+List(ArchFile) arch_at(List(Int) b, Int pos, Int left, ListBuf(ArchFile) acc) {
+    Int plen = if (left > 0 && pos + 2 <= b.len()) { le(b, pos, 2) } else { 0 };
+    Bool head = left > 0 && pos + 2 + plen + 8 <= b.len();
+    Int size = if (head) { le(b, pos + 2 + plen, 8) } else { 0 };
+    Int at = pos + 2 + plen + 8;
+    Bool whole = head && size >= 0 && at + size <= b.len();
+    if (!whole) {
+        List(ArchFile) got = acc.finish();
+        return if (left <= 0 && pos == b.len()) { got } else { [] };
+    }
+    ArchFile f = ArchFile { .path = http_text(b, pos + 2, pos + 2 + plen), .at = at, .size = size };
+    return arch_at(b, at + size, left - 1, acc.push(f));
+}
+
+Option(ArchFile) arch_find(List(ArchFile) fs, Str path, Int i) {
+    if (i >= fs.len()) { return None; }
+    if (fs[i].path == path) { return Some(fs[i]); }
+    return arch_find(fs, path, i + 1);
+}
+
+Bool has_file(List(ArchFile) fs, Str path, Int i) {
+    if (i >= fs.len()) { return false; }
+    if (fs[i].path == path) { return true; }
+    return has_file(fs, path, i + 1);
+}
+
+Bool has_nul(List(Int) b, Int i, Int end) {
+    if (i >= end) { return false; }
+    if (b[i] == 0) { return true; }
+    return has_nul(b, i + 1, end);
+}
+
+// ─── Markup ─────────────────────────────────────────────────────────────
+
+Str esc(Str s) { return ds_escape_html(s); }
+
+// A path segment percent-encoded: nothing in it can end a URL, a quote
+// or an attribute.
+Str pct(Str s) {
+    List(Int) b = http_bytes(s);
+    return pct_at(b, 0, StrBuf());
+}
+
+Str pct_at(List(Int) b, Int i, StrBuf acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    Int c = b[i];
+    Bool plain = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126 || c == 47;
+    StrBuf next = if (plain) { acc.push_char(c) } else { acc.push("%").push(hex2(c)) };
+    return pct_at(b, i + 1, next);
+}
+
+Str hex2(Int c) {
+    Str d = "0123456789ABCDEF";
+    return str_slice(d, c / 16, c / 16 + 1) + str_slice(d, c % 16, c % 16 + 1);
+}
+
+Str size_text(Int n) {
+    if (n < 1024) { return f"{n} B"; }
+    if (n < 1048576) { return f"{n / 1024}.{(n % 1024) * 10 / 1024} KiB"; }
+    return f"{n / 1048576}.{(n % 1048576) * 10 / 1048576} MiB";
+}
+
+Str badge(Str kind, Str text) { return "<span class=\"badge " + kind + "\">" + esc(text) + "</span>"; }
+
+Str index_badge(IndexState s) {
+    Str kind = if (s.status == "verified") { "good" } else { if (s.status == "bad signature") { "bad" } else { "plain" } };
+    return badge(kind, "index " + s.status);
+}
+
+Str css() {
+    return ":root{--bg:#fbfaf7;--fg:#1d1d1b;--muted:#6b6a65;--line:#e4e1d8;--card:#fff;--accent:#2f5d50;--good:#2f6b3a;--bad:#a3272b;--code:#f3f1ea}"
+        + "@media (prefers-color-scheme:dark){:root{--bg:#161614;--fg:#ecebe6;--muted:#9b9a93;--line:#2c2b27;--card:#1e1e1b;--accent:#8cc4b2;--good:#7cc48a;--bad:#ef8a8d;--code:#232320}}"
+        + "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}"
+        + "header{display:flex;gap:12px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line)}header a{color:inherit;text-decoration:none;font-weight:600}"
+        + "main{max-width:980px;margin:0 auto;padding:20px 16px}h1{font-size:22px;margin:0 0 12px}h2{font-size:16px;margin:18px 0 8px}"
+        + ".grow{flex:1}.muted{color:var(--muted)}.badge{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);white-space:nowrap}"
+        + ".good{color:var(--good);border-color:currentColor}.bad{color:var(--bad);border-color:currentColor}.plain{color:var(--muted)}"
+        + "input[type=search]{width:100%;padding:9px 12px;font:inherit;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg)}"
+        + "ul.list{list-style:none;padding:0;margin:12px 0}ul.list li{display:flex;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px;background:var(--card)}"
+        + "a{color:var(--accent)}code,pre{font:13px/1.45 ui-monospace,monospace}pre{background:var(--code);padding:12px;border-radius:8px;overflow:auto;max-height:520px}"
+        + "table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{font-weight:600;color:var(--muted);font-size:13px}"
+        + "button.link{background:none;border:0;padding:0;font:inherit;color:var(--accent);cursor:pointer;text-decoration:underline}"
+        + ".hash{word-break:break-all}.cols{display:grid;grid-template-columns:minmax(0,260px) minmax(0,1fr);gap:16px}@media (max-width:700px){.cols{grid-template-columns:1fr}}"
+        + ".live{font-size:13px}.on{color:var(--good)}.off{color:var(--muted)}";
+}
+
+// The page around `body`. The live stream runs from its own element, so
+// fetches the page makes do not cancel it; its indicator comes first, as
+// Datastar applies attributes in order.
+Str page(Opts o, Str title, Str signals, Str live_url, Str body) {
+    Str client = if (o.cdn) { ds_cdn_script_tag() } else { ds_script_tag() };
+    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        + "<title>" + esc(title) + "</title><style>" + css() + "</style>" + client + "</head>"
+        + "<body data-signals=\"" + ds_escape_attr(signals) + "\">"
+        + "<header><a href=\"/\">resid registry</a><span class=\"grow\"></span>"
+        + "<span class=\"live\" data-indicator:live data-init=\"@get('" + live_url + "')\">"
+        + "<span class=\"on\" data-show=\"$live\">&#9679; live</span><span class=\"off\" data-show=\"!$live\">&#9675; offline</span></span></header>"
+        + "<main>" + body + "</main><div id=\"pulse\" hidden></div></body></html>";
+}
+
+Str package_list(List(Package) ps, Str q) {
+    if (ps.len() == 0) {
+        Str msg = if (q == "") { "Nothing is published yet." } else { "No package matches “" + esc(q) + "”." };
+        return "<div id=\"packages\"><p class=\"muted\">" + msg + "</p></div>";
+    }
+    return "<div id=\"packages\"><ul class=\"list\">" + package_rows(ps, 0, StrBuf()) + "</ul></div>";
+}
+
+Str package_rows(List(Package) ps, Int i, StrBuf b) {
+    if (i >= ps.len()) { return b.finish(); }
+    Package p = ps[i];
+    Str n = if (p.versions == 1) { "1 version" } else { f"{p.versions} versions" };
+    Str un = if (p.indexed) { "" } else { " " + badge("plain", "not in index") };
+    Str row = "<li><a href=\"/pkg/" + pct(p.name) + "\"><strong>" + esc(p.name) + "</strong></a><code>" + esc(p.latest) + "</code><span class=\"grow\"></span>" + un + "<span class=\"muted\">" + n + "</span></li>";
+    return package_rows(ps, i + 1, b.push(row));
+}
+
+Str home_body(Registry reg, Str q) {
+    List(Package) all = packages(reg.entries, 0, ListBuf());
+    Str count = f"{all.len()} package(s), {reg.entries.len()} archive(s)";
+    return "<h1>Packages</h1><p class=\"muted\">" + count + " &middot; " + index_badge(reg.index) + "</p>"
+        + "<input type=\"search\" placeholder=\"Search packages\" aria-label=\"Search packages\" data-bind:q data-on:input__debounce.200ms=\"@get('/ui/search')\">"
+        + package_list(matching(all, str_to_lower(str_trim(q)), 0, ListBuf()), q);
+}
+
+Str versions_table(Str name, List(Entry) vs) {
+    return "<div id=\"versions\"><table><tr><th>Version</th><th>Index</th></tr>" + version_rows(name, vs, 0, StrBuf()) + "</table></div>";
+}
+
+Str version_rows(Str name, List(Entry) vs, Int i, StrBuf b) {
+    if (i >= vs.len()) { return b.finish(); }
+    Entry e = vs[i];
+    Str get = "@get('/ui/version/" + pct(name) + "/" + pct(e.version) + "')";
+    Str ix = if (e.indexed) { badge("plain", "listed") } else { badge("plain", "not listed") };
+    Str row = "<tr><td><button class=\"link\" data-on:click=\"" + get + "\">" + esc(e.version) + "</button></td><td>" + ix + "</td></tr>";
+    return version_rows(name, vs, i + 1, b.push(row));
+}
+
+// One version: what the registry records, what the archive hashes to,
+// its signature, and its files.
+@requires(filesystem(readonly))
+Str version_detail(Str root, Str pubkey, Entry e) {
+    Str base = pkg_base(root, e.name, e.version);
+    List(Int) arch = if (filesystem.exists(base + "-pkg")) { filesystem.read_bytes(base + "-pkg") } else { [] };
+    Str actual = hex_encode(sha256_bytes(arch));
+    Str sig = str_trim(read_text(base + "-sig"));
+    Str hash_badge = if (arch.len() == 0) { badge("bad", "archive missing") } else { if (actual == e.recorded) { badge("good", "hash matches") } else { badge("bad", "hash differs") } };
+    Str sig_badge = if (sig == "") { badge("plain", "unsigned") } else { if (pubkey == "") { badge("plain", "signed (no key to check)") } else { if (verify_sig(actual, hex_bytes(sig), hex_bytes(pubkey))) { badge("good", "signature verified") } else { badge("bad", "signature invalid") } } };
+    List(ArchFile) files = arch_files(arch);
+    Str dl = "/download/" + pct(e.name) + "/" + pct(e.version);
+    Str first = if (has_file(files, "resid.toml", 0)) { file_view(e, arch, files, "resid.toml") } else { "<div id=\"viewer\"><p class=\"muted\">Pick a file.</p></div>" };
+    return "<div id=\"detail\"><h2>" + esc(e.name) + " <code>" + esc(e.version) + "</code></h2>"
+        + "<p>" + hash_badge + " " + sig_badge + " <a href=\"" + dl + "\">download</a> <span class=\"muted\">" + size_text(arch.len()) + "</span></p>"
+        + "<table><tr><th>Recorded</th><td><code class=\"hash\">" + esc(e.recorded) + "</code></td></tr>"
+        + "<tr><th>Archive</th><td><code class=\"hash\">" + esc(actual) + "</code></td></tr></table>"
+        + "<h2>Files</h2><div class=\"cols\"><ul class=\"list\">" + file_rows(e, files, 0, StrBuf()) + "</ul>" + first + "</div></div>";
+}
+
+Str file_rows(Entry e, List(ArchFile) fs, Int i, StrBuf b) {
+    if (i >= fs.len()) { return b.finish(); }
+    Str get = "@get('/ui/file/" + pct(e.name) + "/" + pct(e.version) + "/" + pct(fs[i].path) + "')";
+    Str row = "<li><button class=\"link\" data-on:click=\"" + get + "\">" + esc(fs[i].path) + "</button><span class=\"grow\"></span><span class=\"muted\">" + size_text(fs[i].size) + "</span></li>";
+    return file_rows(e, fs, i + 1, b.push(row));
+}
+
+Str file_view(Entry e, List(Int) arch, List(ArchFile) fs, Str path) {
+    Option(ArchFile) f = arch_find(fs, path, 0);
+    return match f {
+        Some(x) => "<div id=\"viewer\"><h2><code>" + esc(x.path) + "</code></h2>"
+            + if (has_nul(arch, x.at, x.at + x.size) || x.size > 1048576) { "<p class=\"muted\">Not shown: " + size_text(x.size) + " of binary or large content.</p>" } else { "<pre>" + esc(http_text(arch, x.at, x.at + x.size)) + "</pre>" }
+            + "</div>",
+        None => "<div id=\"viewer\"><p class=\"muted\">No such file.</p></div>"
+    };
+}
+
+Str package_body(Str root, Str pubkey, Registry reg, Str name) {
+    List(Entry) vs = versions_of(reg.entries, name, 0, ListBuf());
+    return "<h1>" + esc(name) + "</h1><p class=\"muted\">" + index_badge(reg.index) + "</p>"
+        + versions_table(name, vs) + "<div id=\"detail\"></div>";
+}
+
+// ─── Handlers ───────────────────────────────────────────────────────────
+
+HttpReply html(Int status, Str body) {
+    return http_with_header(http_reply_text(status, "text/html; charset=utf-8", body), "Cache-Control", "no-cache");
+}
+
+HttpReply not_found(Opts o) {
+    return html(404, page(o, "Not found", "{}", "/ui/live", "<h1>Not found</h1><p><a href=\"/\">All packages</a></p>"));
+}
+
+Entry find_entry(List(Entry) es, Str name, Str version, Int i) {
+    if (i >= es.len()) { return Entry { .name = "", .version = "", .recorded = "", .indexed = false }; }
+    if (es[i].name == name && es[i].version == version) { return es[i]; }
+    return find_entry(es, name, version, i + 1);
+}
+
+Str cap(Map(Str, Str) m, Str k) { return m.get(k) else { "" }; }
+
+// The live stream: poll the registry's fingerprint every `poll_ms`; when
+// it moves, drop an element into #pulse whose data-init fetches `refresh`
+// with the page's current signals. A comment every 15 s keeps it open.
+type Live = { Str root; Str fp; Str refresh; Int poll_ms; Int idle; };
+
+@requires(filesystem(readonly))
+HttpStep(Live) live_step(Live s) {
+    Str now = fingerprint(s.root);
+    Int quiet = 15000 / s.poll_ms;
+    if (now != s.fp) {
+        Str pulse = "<div id=\"pulse-" + str_slice(now, 0, 12) + "\" data-init=\"@get('" + s.refresh + "')\"></div>";
+        Live next = Live { .root = s.root, .fp = now, .refresh = s.refresh, .poll_ms = s.poll_ms, .idle = 0 };
+        return ds_step(next, [ds_patch_elements(pulse, selector = "#pulse", mode = ModeInner)], s.poll_ms);
+    }
+    Bool ping = s.idle + 1 >= quiet;
+    Live later = Live { .root = s.root, .fp = s.fp, .refresh = s.refresh, .poll_ms = s.poll_ms, .idle = if (ping) { 0 } else { s.idle + 1 } };
+    List(Str) out = if (ping) { [ds_keepalive()] } else { [] };
+    return ds_step(later, out, s.poll_ms);
+}
+
+@requires(filesystem(readonly))
+HttpOut(Live) live(Opts o, Str refresh) {
+    Live s = Live { .root = o.root, .fp = fingerprint(o.root), .refresh = refresh, .poll_ms = o.poll_ms, .idle = 0 };
+    return ds_stream(s, [], o.poll_ms, lambda(x) { live_step(x) });
+}
+
+@requires(filesystem(readonly))
+HttpOut(Live) route(Opts o, HttpRequest r) {
+    if (r.method != "GET" && r.method != "HEAD") { return Whole(http_with_header(http_reply_status(405), "Allow", "GET, HEAD")); }
+    if (r.path == ds_client_path()) { return Whole(ds_client_reply()); }
+    if (r.path == "/") {
+        Registry reg = load(o.root, o.pubkey);
+        return Whole(html(200, page(o, "resid registry", "{q: ''}", "/ui/live/home", home_body(reg, ""))));
+    }
+    if (r.path == "/ui/live/home") { return live(o, "/ui/search"); }
+    if (r.path == "/ui/search") {
+        Result(Value, Str) sig = ds_read_signals_value(r);
+        Value v = sig else { VUnit };
+        Str q = ds_signal_text(v, "q");
+        Registry reg = load(o.root, o.pubkey);
+        List(Package) ps = matching(packages(reg.entries, 0, ListBuf()), str_to_lower(str_trim(q)), 0, ListBuf());
+        return Whole(ds_reply([ds_patch_elements(package_list(ps, q))]));
+    }
+    Map(Str, Str) none = {};
+    Map(Str, Str) pk = http_route("/pkg/:name", r.path) else { none };
+    if (pk.len() > 0 && safe_word(cap(pk, "name"))) {
+        Str name = cap(pk, "name");
+        Registry reg = load(o.root, o.pubkey);
+        List(Entry) vs = versions_of(reg.entries, name, 0, ListBuf());
+        if (vs.len() == 0) { return Whole(not_found(o)); }
+        Str body = package_body(o.root, o.pubkey, reg, name);
+        Str init = "<div data-init=\"@get('/ui/version/" + pct(name) + "/" + pct(vs[0].version) + "')\"></div>";
+        return Whole(html(200, page(o, name + " - resid registry", "{}", "/ui/live/pkg/" + pct(name), body + init)));
+    }
+    Map(Str, Str) lp = http_route("/ui/live/pkg/:name", r.path) else { none };
+    if (lp.len() > 0 && safe_word(cap(lp, "name"))) { return live(o, "/ui/versions/" + pct(cap(lp, "name"))); }
+    Map(Str, Str) vl = http_route("/ui/versions/:name", r.path) else { none };
+    if (vl.len() > 0 && safe_word(cap(vl, "name"))) {
+        Registry reg = load(o.root, o.pubkey);
+        Str name = cap(vl, "name");
+        return Whole(ds_reply([ds_patch_elements(versions_table(name, versions_of(reg.entries, name, 0, ListBuf())))]));
+    }
+    Map(Str, Str) vd = http_route("/ui/version/:name/:version", r.path) else { none };
+    if (vd.len() > 0 && safe_word(cap(vd, "name")) && safe_word(cap(vd, "version"))) {
+        Registry reg = load(o.root, o.pubkey);
+        Entry e = find_entry(reg.entries, cap(vd, "name"), cap(vd, "version"), 0);
+        if (e.name == "") { return Whole(ds_reply([ds_patch_elements("<div id=\"detail\"><p class=\"muted\">That version is gone.</p></div>")])); }
+        return Whole(ds_reply([ds_patch_elements(version_detail(o.root, o.pubkey, e))]));
+    }
+    Map(Str, Str) fv = http_route("/ui/file/:name/:version/*", r.path) else { none };
+    if (fv.len() > 0 && safe_word(cap(fv, "name")) && safe_word(cap(fv, "version"))) {
+        Str name = cap(fv, "name");
+        Str version = cap(fv, "version");
+        Str base = pkg_base(o.root, name, version);
+        List(Int) arch = if (filesystem.exists(base + "-pkg")) { filesystem.read_bytes(base + "-pkg") } else { [] };
+        Entry e = Entry { .name = name, .version = version, .recorded = "", .indexed = false };
+        Str path = decode_segments(str_split(cap(fv, "*"), "/"), 0, ListBuf());
+        return Whole(ds_reply([ds_patch_elements(file_view(e, arch, arch_files(arch), path))]));
+    }
+    Map(Str, Str) dl = http_route("/download/:name/:version", r.path) else { none };
+    if (dl.len() > 0 && safe_word(cap(dl, "name")) && safe_word(cap(dl, "version"))) {
+        Str file = pkg_base(o.root, cap(dl, "name"), cap(dl, "version")) + "-pkg";
+        if (!filesystem.exists(file)) { return Whole(not_found(o)); }
+        HttpReply a = http_reply_bytes(200, "application/octet-stream", filesystem.read_bytes(file));
+        return Whole(http_with_header(a, "Content-Disposition", "attachment; filename=\"" + cap(dl, "name") + "-" + cap(dl, "version") + ".resid-pkg\""));
+    }
+    return Whole(not_found(o));
+}
+
+List(Str) decoded(List(Str) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return decoded(xs, i + 1, acc.push(http_url_decode(xs[i], false)));
+}
+
+Str decode_segments(List(Str) xs, Int i, ListBuf(Str) acc) { return str_join(decoded(xs, i, acc), "/"); }
+
+// ─── Command line ───────────────────────────────────────────────────────
+
+Str usage() { return "usage: resid-registry-ui <registry> [--port N] [--port-file F] [--pubkey HEX] [--cdn] [--poll-ms N] [--requests N]"; }
+
+Opts with(Opts o, Str root, Int port, Str port_file, Str pubkey, Bool cdn, Int poll_ms, Int requests, Bool ok) {
+    return Opts { .root = root, .port = port, .port_file = port_file, .pubkey = pubkey, .cdn = cdn, .poll_ms = poll_ms, .requests = requests, .ok = ok };
+}
+
+Int num(Str s) { return if (str_is_int(s)) { str_parse_int(s) } else { -1 }; }
+
+@requires(args)
+Opts parse(Int i, Opts o) {
+    if (i >= args.count()) { return o; }
+    Str a = args.get(i);
+    Str v = if (i + 1 < args.count()) { args.get(i + 1) } else { "" };
+    Bool has = i + 1 < args.count();
+    if (a == "--cdn") { return parse(i + 1, with(o, o.root, o.port, o.port_file, o.pubkey, true, o.poll_ms, o.requests, o.ok)); }
+    if (a == "--port" && has) { return parse(i + 2, with(o, o.root, num(v), o.port_file, o.pubkey, o.cdn, o.poll_ms, o.requests, o.ok && num(v) >= 0)); }
+    if (a == "--port-file" && has) { return parse(i + 2, with(o, o.root, o.port, v, o.pubkey, o.cdn, o.poll_ms, o.requests, o.ok)); }
+    if (a == "--pubkey" && has) { return parse(i + 2, with(o, o.root, o.port, o.port_file, str_trim(v), o.cdn, o.poll_ms, o.requests, o.ok && str_len(str_trim(v)) == 64)); }
+    if (a == "--poll-ms" && has) { return parse(i + 2, with(o, o.root, o.port, o.port_file, o.pubkey, o.cdn, num(v), o.requests, o.ok && num(v) >= 50)); }
+    if (a == "--requests" && has) { return parse(i + 2, with(o, o.root, o.port, o.port_file, o.pubkey, o.cdn, o.poll_ms, num(v), o.ok && num(v) >= 0)); }
+    if (!str_starts_with(a, "--") && o.root == "") { return parse(i + 1, with(o, a, o.port, o.port_file, o.pubkey, o.cdn, o.poll_ms, o.requests, o.ok)); }
+    return with(o, o.root, o.port, o.port_file, o.pubkey, o.cdn, o.poll_ms, o.requests, false);
+}
+
+@requires(args, filesystem, network(readonly))
+Int main() {
+    Opts start = Opts { .root = "", .port = 8090, .port_file = "", .pubkey = "", .cdn = false, .poll_ms = 1000, .requests = 0, .ok = true };
+    Opts o = parse(1, start);
+    if (!o.ok || o.root == "") { eprintln(usage()); return 2; }
+    if (!filesystem.is_dir(o.root)) { eprintln("resid-registry-ui: not a directory: " + o.root); return 1; }
+    Int lfd = http_listen(o.port);
+    if (lfd < 0) { eprintln(f"resid-registry-ui: cannot listen on 127.0.0.1:{o.port}"); return 1; }
+    Int port = http_bound_port(lfd);
+    if (o.port_file != "") { filesystem.write_all(o.port_file, f"{port}\n"); }
+    println(f"resid-registry-ui: http://127.0.0.1:{port}/ serving " + o.root);
+    HttpOut(Live) closure(HttpRequest) h = lambda(r) { route(o, r) };
+    Result(Int, RegionError) served = spawn (network(readonly), filesystem(readonly)) {
+        return http_stream_loop(lfd, h, http_limits(), o.requests);
+    };
+    Int n = served else { -1 };
+    return if (n >= 0) { 0 } else { 1 };
+}

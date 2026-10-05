@@ -1,0 +1,50 @@
+// The smallest Datastar app: a counter the server keeps in the page's
+// signals, and a ticker the server pushes over one long-lived stream.
+//
+//   residc examples/counter.resid -o counter && ./counter [--port N]
+//   then open http://127.0.0.1:8080/
+
+import "../src/datastar.resid";
+import "../../resid-serial/src/value.resid";
+
+Str home() {
+    return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Counter</title>" + ds_script_tag() + "</head>"
+        + "<body data-signals=\"{count: 0}\" style=\"font:16px system-ui;margin:40px\">"
+        + "<h1>Count: <span data-text=\"$count\"></span></h1>"
+        + "<button data-on:click=\"@post('/inc')\">+1</button> "
+        + "<button data-on:click=\"@post('/reset')\">reset</button>"
+        + "<p id=\"said\"></p>"
+        + "<p data-init=\"@get('/ticks')\">Ticks from the server: <b id=\"ticks\">0</b></p>"
+        + "</body></html>";
+}
+
+// The stream's state is the tick count; one step per second, for good.
+HttpStep(Int) tick(Int n) {
+    return ds_step(n + 1, [ds_patch_elements(f"<b id=\"ticks\">{n}</b>")], 1000);
+}
+
+HttpOut(Int) handle(HttpRequest r) {
+    if (r.path == ds_client_path()) { return Whole(ds_client_reply()); }
+    if (r.path == "/") { return Whole(http_reply_text(200, "text/html; charset=utf-8", home())); }
+    if (r.path == "/ticks") { return ds_stream(1, [], 1000, lambda(n) { tick(n) }); }
+    if (r.method == "POST" && (r.path == "/inc" || r.path == "/reset")) {
+        Result(Value, Str) got = ds_read_signals_value(r);
+        Value s = got else { VUnit };
+        Int next = if (r.path == "/inc") { ds_signal_int(s, "count", 0) + 1 } else { 0 };
+        return Whole(ds_reply([
+            ds_patch_signals(f"{{\"count\": {next}}}"),
+            ds_patch_elements(f"<p id=\"said\">The server saw {next}.</p>")
+        ]));
+    }
+    return Whole(http_reply_status(404));
+}
+
+@requires(args, network(readonly))
+Int main() {
+    Int port = if (args.count() > 2 && args.get(1) == "--port") { str_parse_int(args.get(2)) } else { 8080 };
+    Int lfd = http_listen(port);
+    if (lfd < 0) { eprintln(f"cannot listen on {port}"); return 1; }
+    println(f"http://127.0.0.1:{http_bound_port(lfd)}/");
+    HttpOut(Int) closure(HttpRequest) h = lambda(r) { handle(r) };
+    return if (http_stream_loop(lfd, h, http_limits(), 0) >= 0) { 0 } else { 1 };
+}

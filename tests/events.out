@@ -1,0 +1,38 @@
+ok send minimal
+ok send id retry data
+ok send default retry omitted
+ok send id line break dropped
+ok patch minimal
+ok patch all options
+ok patch transition selector needs transition
+ok patch svg
+ok patch crlf lines
+ok modes round trip
+ok namespace mathml
+ok remove
+ok signals minimal
+ok signals all options
+ok signals multiline
+ok signals of a value
+ok null patch nests
+ok null patch whole key wins
+ok remove signals
+ok script defaults
+ok script options
+ok redirect
+ok replace url
+ok console
+ok dispatch
+ok keepalive
+ok escape html
+ok json string
+ok reply head
+ok reply body
+ok client version
+ok client bytes
+ok client head line
+ok client path
+ok script tag
+ok cdn tag
+ok client reply
+exit 0

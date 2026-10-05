@@ -1,0 +1,88 @@
+// The server Datastar's SDK test suite drives (tests/spec, from
+// starfederation/datastar sdk/test at v1.0.4): /test reads the signals,
+// takes their `events` array and answers each with the event it names.
+//
+//   sdk_server --port-file F [--port N] [--requests N]
+
+import "../src/datastar.resid";
+import "../../resid-serial/src/value.resid";
+
+Str field_text(Value ev, Str name) { return ds_signal_text(ev, name); }
+
+Bool field_bool(Value ev, Str name, Bool fallback) {
+    Option(Value) v = value_field(ev, name);
+    return match v { Some(x) => match x { VBool(b) => b, _ => fallback }, None => fallback };
+}
+
+Int retry_of(Value ev) { return ds_signal_int(ev, "retryDuration", ds_default_retry_ms()); }
+
+// `{"type": "text/javascript"}` as `type="text/javascript"`, in order.
+List(Str) attributes(Value ev) {
+    Option(Value) a = value_field(ev, "attributes");
+    List(Str) none = [];
+    return match a { Some(v) => match v { VMap(es) => attr_list(es, 0, ListBuf()), _ => none }, None => none };
+}
+
+List(Str) attr_list(List(VEntry) es, Int i, ListBuf(Str) acc) {
+    if (i >= es.len()) { return acc.finish(); }
+    Str k = ds_value_text(es[i].key);
+    return attr_list(es, i + 1, acc.push(ds_attr(k, ds_value_text(es[i].val))));
+}
+
+Str event_of(Value ev) {
+    Str kind = field_text(ev, "type");
+    Str id = field_text(ev, "eventId");
+    Int retry = retry_of(ev);
+    if (kind == "patchElements") {
+        DsMode mode = ds_mode_of(field_text(ev, "mode")) else { ModeOuter };
+        DsNamespace ns = ds_namespace_of(field_text(ev, "namespace")) else { NsHtml };
+        return ds_patch_elements(field_text(ev, "elements"), selector = field_text(ev, "selector"), mode = mode,
+            use_view_transition = field_bool(ev, "useViewTransition", false),
+            view_transition_selector = field_text(ev, "viewTransitionSelector"), namespace = ns, event_id = id, retry_ms = retry);
+    }
+    if (kind == "patchSignals") {
+        Option(Value) raw = value_field(ev, "signals-raw");
+        Str signals = match raw { Some(r) => ds_value_text(r), None => field_text(ev, "signals") };
+        return ds_patch_signals(signals, only_if_missing = field_bool(ev, "onlyIfMissing", false), event_id = id, retry_ms = retry);
+    }
+    if (kind == "executeScript") {
+        return ds_execute_script(field_text(ev, "script"), auto_remove = field_bool(ev, "autoRemove", true), attributes = attributes(ev), event_id = id, retry_ms = retry);
+    }
+    return "";
+}
+
+List(Str) events_of(List(Value) evs, Int i, ListBuf(Str) acc) {
+    if (i >= evs.len()) { return acc.finish(); }
+    return events_of(evs, i + 1, acc.push(event_of(evs[i])));
+}
+
+HttpReply handle(HttpRequest r) {
+    if (r.path != "/test") { return http_reply_status(404); }
+    Result(Value, Str) got = ds_read_signals_value(r);
+    if (Err(e) = got) { return http_reply_text(400, "text/plain", e + "\n"); }
+    Value signals = got else { VUnit };
+    Option(Value) evs = value_field(signals, "events");
+    List(Value) none = [];
+    List(Value) list = match evs { Some(v) => match v { VSeq(xs) => xs, _ => none }, None => none };
+    return ds_reply(events_of(list, 0, ListBuf()));
+}
+
+@requires(args, network(readonly), filesystem)
+Int main() {
+    Str port_file = arg_after("--port-file", 1);
+    Str ps = arg_after("--port", 1);
+    Int port = if (str_is_int(ps)) { str_parse_int(ps) } else { 0 };
+    Str rs = arg_after("--requests", 1);
+    Int requests = if (str_is_int(rs)) { str_parse_int(rs) } else { 0 };
+    Int lfd = http_listen(port);
+    if (lfd < 0) { eprintln("listen failed"); return 1; }
+    if (port_file != "") { filesystem.write_all(port_file, f"{http_bound_port(lfd)}\n"); }
+    return if (http_accept_loop(lfd, lambda(q) { handle(q) }, http_limits(), requests) >= 0) { 0 } else { 1 };
+}
+
+@requires(args)
+Str arg_after(Str flag, Int i) {
+    if (i + 1 >= args.count()) { return ""; }
+    if (args.get(i) == flag) { return args.get(i + 1); }
+    return arg_after(flag, i + 1);
+}

@@ -1,0 +1,18 @@
+[package]
+name = "resid-datastar"
+version = "0.1.0"
+
+# The SDK is pure: no capabilities. The registry UI (ui/registry.resid)
+# grants itself what it uses from its own main: args, filesystem (the
+# port file; the registry is only read) and network(readonly).
+[capabilities]
+grant = []
+
+# JSON for the signals. src/datastar.resid imports
+# ../../resid-json/src/json.resid and ../../resid-serial/src/value.resid,
+# so checkouts beside this one work as they are.
+[dependencies.resid-json]
+path = "../resid-json"
+
+[dependencies.resid-serial]
+path = "../resid-serial"

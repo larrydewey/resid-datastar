@@ -1,0 +1,19 @@
+ok get query
+ok delete query
+ok post body
+ok put body
+ok patch body
+ok get without parameter
+ok post without body
+ok invalid json
+ok typed
+ok typed mismatch
+ok is request
+ok path text
+ok path number
+ok path array
+ok path missing
+ok path null
+ok int from text
+ok bool
+exit 0

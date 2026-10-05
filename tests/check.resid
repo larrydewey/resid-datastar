@@ -1,0 +1,19 @@
+// Golden-test helper: "ok NAME", or "FAIL NAME" with both sides.
+@needs(Show(T), Eq(T))
+pub Bool check(Str name, T got, T want) {
+    if (got == want) {
+        println("ok " + name);
+        return true;
+    }
+    println("FAIL " + name);
+    println("  want: " + str_replace(f"{want}", "\n", "\\n"));
+    println("  got:  " + str_replace(f"{got}", "\n", "\\n"));
+    return false;
+}
+
+// The exit status of a run: 1 when any check failed.
+pub Int status(List(Bool) rs, Int i) {
+    if (i >= rs.len()) { return 0; }
+    if (!rs[i]) { return 1; }
+    return status(rs, i + 1);
+}

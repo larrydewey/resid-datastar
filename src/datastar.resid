@@ -1,0 +1,382 @@
+// ─── src/datastar.resid — a Datastar server SDK ────────────────────────
+// Datastar (https://data-star.dev) drives a page from the server: the
+// browser sends its signals as JSON, the server answers with server-sent
+// events that patch elements and signals. This is the SDK of the
+// specification in Datastar's sdk/ADR.md, over lib/httpserv.resid:
+//
+//   ds_patch_elements / ds_remove_elements   datastar-patch-elements
+//   ds_patch_signals / ds_remove_signals     datastar-patch-signals
+//   ds_execute_script (+ redirect, console, custom events, replace url)
+//   ds_read_signals                          GET/DELETE ?datastar=, else body
+//
+// An event is its text; a reply is a list of them. `ds_reply` answers
+// whole, `ds_stream` keeps the connection and sends events as later steps
+// make them (lib/httpserv.resid `http_stream_loop`). The client bundle is
+// embedded (src/client.resid), so a server needs no file to serve it.
+//
+// No capabilities: everything here is text.
+
+import "httpserv.resid";
+import "client.resid";
+import "../../resid-json/src/json.resid";
+import "../../resid-serial/src/value.resid";
+
+// ─── Protocol names ─────────────────────────────────────────────────────
+
+// How elements go into the DOM. Outer and inner morph (keeping state);
+// the rest replace, insert or remove.
+type DsMode = ModeOuter | ModeInner | ModeRemove | ModeReplace | ModePrepend | ModeAppend | ModeBefore | ModeAfter;
+
+// The namespace new elements are created in.
+type DsNamespace = NsHtml | NsSvg | NsMathml;
+
+pub Str ds_mode_name(DsMode m) {
+    return match m {
+        ModeOuter => "outer", ModeInner => "inner", ModeRemove => "remove", ModeReplace => "replace",
+        ModePrepend => "prepend", ModeAppend => "append", ModeBefore => "before", ModeAfter => "after"
+    };
+}
+
+// A mode by its protocol name.
+pub Option(DsMode) ds_mode_of(Str s) {
+    if (s == "outer") { return Some(ModeOuter); }
+    if (s == "inner") { return Some(ModeInner); }
+    if (s == "remove") { return Some(ModeRemove); }
+    if (s == "replace") { return Some(ModeReplace); }
+    if (s == "prepend") { return Some(ModePrepend); }
+    if (s == "append") { return Some(ModeAppend); }
+    if (s == "before") { return Some(ModeBefore); }
+    if (s == "after") { return Some(ModeAfter); }
+    return None;
+}
+
+pub Str ds_namespace_name(DsNamespace n) {
+    return match n { NsHtml => "html", NsSvg => "svg", NsMathml => "mathml" };
+}
+
+pub Option(DsNamespace) ds_namespace_of(Str s) {
+    if (s == "html") { return Some(NsHtml); }
+    if (s == "svg") { return Some(NsSvg); }
+    if (s == "mathml") { return Some(NsMathml); }
+    return None;
+}
+
+pub Str ds_event_patch_elements() { return "datastar-patch-elements"; }
+pub Str ds_event_patch_signals() { return "datastar-patch-signals"; }
+
+// The reconnect delay a client assumes; `retry:` is sent only otherwise.
+pub Int ds_default_retry_ms() { return 1000; }
+
+// ─── Events ─────────────────────────────────────────────────────────────
+
+// One event: `event:`, `id:` when given, `retry:` unless the default,
+// a `data:` line for each of `data_lines`, and the blank line. A line
+// break inside an id would end the field early, so it is dropped.
+pub Str ds_send(Str event_type, List(Str) data_lines, Str event_id = "", Int retry_ms = 1000) {
+    StrBuf b0 = StrBuf().push("event: ").push(event_type).push("\n");
+    StrBuf b1 = if (event_id == "") { b0 } else { b0.push("id: ").push(ds_one_line(event_id)).push("\n") };
+    StrBuf b2 = if (retry_ms > 0 && retry_ms != ds_default_retry_ms()) { b1.push(f"retry: {retry_ms}\n") } else { b1 };
+    return ds_data_lines(data_lines, 0, b2).push("\n").finish();
+}
+
+StrBuf ds_data_lines(List(Str) ls, Int i, StrBuf b) {
+    if (i >= ls.len()) { return b; }
+    return ds_data_lines(ls, i + 1, b.push("data: ").push(ls[i]).push("\n"));
+}
+
+Str ds_one_line(Str s) { return str_replace(str_replace(s, "\r", ""), "\n", ""); }
+
+// `key` before each line of `text` (a CRLF counts as one break).
+List(Str) ds_keyed(Str key, Str text) {
+    List(Str) ls = str_split(str_replace(text, "\r\n", "\n"), "\n");
+    return ds_keyed_at(key, ls, 0, ListBuf());
+}
+
+List(Str) ds_keyed_at(Str key, List(Str) ls, Int i, ListBuf(Str) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    return ds_keyed_at(key, ls, i + 1, acc.push(key + " " + str_replace(ls[i], "\r", "")));
+}
+
+// Patch elements into the DOM. Without a selector each top-level element
+// is matched by its id. Only what differs from the defaults is sent.
+pub Str ds_patch_elements(Str elements, Str selector = "", DsMode mode = ModeOuter, Bool use_view_transition = false, Str view_transition_selector = "", DsNamespace namespace = NsHtml, Str event_id = "", Int retry_ms = 1000) {
+    List(Str) sel = if (selector == "") { [] } else { ["selector " + ds_one_line(selector)] };
+    Str mname = ds_mode_name(mode);
+    List(Str) md = if (mname == "outer") { [] } else { ["mode " + mname] };
+    List(Str) vt = if (use_view_transition) { ["useViewTransition true"] } else { [] };
+    List(Str) vts = if (use_view_transition && view_transition_selector != "") { ["viewTransitionSelector " + ds_one_line(view_transition_selector)] } else { [] };
+    Str nname = ds_namespace_name(namespace);
+    List(Str) ns = if (nname == "html") { [] } else { ["namespace " + nname] };
+    List(Str) els = if (elements == "") { [] } else { ds_keyed("elements", elements) };
+    List(Str) lines = sel.concat(md).concat(vt).concat(vts).concat(ns).concat(els);
+    return ds_send(ds_event_patch_elements(), lines, event_id = event_id, retry_ms = retry_ms);
+}
+
+// Remove the elements a selector matches.
+pub Str ds_remove_elements(Str selector, Bool use_view_transition = false, Str view_transition_selector = "", Str event_id = "", Int retry_ms = 1000) {
+    return ds_patch_elements("", selector = selector, mode = ModeRemove, use_view_transition = use_view_transition, view_transition_selector = view_transition_selector, event_id = event_id, retry_ms = retry_ms);
+}
+
+// Patch signals with a JSON merge patch (RFC 7386): a member sets, a
+// `null` removes, an object recurses.
+pub Str ds_patch_signals(Str signals, Bool only_if_missing = false, Str event_id = "", Int retry_ms = 1000) {
+    List(Str) oim = if (only_if_missing) { ["onlyIfMissing true"] } else { [] };
+    return ds_send(ds_event_patch_signals(), oim.concat(ds_keyed("signals", signals)), event_id = event_id, retry_ms = retry_ms);
+}
+
+// Patch signals from any value with a JSON encoding.
+@needs(Encode(T, JsonEnc))
+pub Result(Str, SerialError) ds_patch_signals_of(T x, Bool only_if_missing = false, Str event_id = "", Int retry_ms = 1000) {
+    Str text = to_json(x)?;
+    return Ok(ds_patch_signals(text, only_if_missing = only_if_missing, event_id = event_id, retry_ms = retry_ms));
+}
+
+// Remove signals by path (`"user.name"`): a patch setting each to null.
+pub Str ds_remove_signals(List(Str) paths, Str event_id = "", Int retry_ms = 1000) {
+    return ds_patch_signals(ds_null_patch(paths), event_id = event_id, retry_ms = retry_ms);
+}
+
+// The merge patch that nulls every path, nested by its dots, in the
+// order the paths first name each key.
+pub Str ds_null_patch(List(Str) paths) {
+    List(List(Str)) split = ds_split_paths(paths, 0, ListBuf());
+    return ds_null_obj(split);
+}
+
+List(List(Str)) ds_split_paths(List(Str) ps, Int i, ListBuf(List(Str)) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return ds_split_paths(ps, i + 1, acc.push(str_split(ps[i], ".")));
+}
+
+// One object level: each first key once, then what is under it.
+Str ds_null_obj(List(List(Str)) ps) {
+    List(Str) keys = ds_first_keys(ps, 0, ListBuf(), []);
+    return "{" + ds_null_members(ps, keys, 0, StrBuf()) + "}";
+}
+
+List(Str) ds_first_keys(List(List(Str)) ps, Int i, ListBuf(Str) acc, List(Str) seen) {
+    if (i >= ps.len()) { return acc.finish(); }
+    Str k = ps[i][0];
+    if (seen.contains(k)) { return ds_first_keys(ps, i + 1, acc, seen); }
+    return ds_first_keys(ps, i + 1, acc.push(k), seen.concat([k]));
+}
+
+Str ds_null_members(List(List(Str)) ps, List(Str) keys, Int i, StrBuf b) {
+    if (i >= keys.len()) { return b.finish(); }
+    Str k = keys[i];
+    List(List(Str)) under = ds_under(ps, k, 0, ListBuf());
+    // A path that ends here wins over deeper ones: the whole key goes.
+    Bool whole = ds_ends_at(ps, k, 0);
+    Str v = if (whole || under.len() == 0) { "null" } else { ds_null_obj(under) };
+    Str sep = if (i == 0) { "" } else { "," };
+    return ds_null_members(ps, keys, i + 1, b.push(sep).push(ds_json_str(k)).push(":").push(v));
+}
+
+List(List(Str)) ds_under(List(List(Str)) ps, Str k, Int i, ListBuf(List(Str)) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    Bool deeper = ps[i][0] == k && ps[i].len() > 1;
+    ListBuf(List(Str)) next = if (deeper) { acc.push(ps[i][1..]) } else { acc };
+    return ds_under(ps, k, i + 1, next);
+}
+
+Bool ds_ends_at(List(List(Str)) ps, Str k, Int i) {
+    if (i >= ps.len()) { return false; }
+    if (ps[i][0] == k && ps[i].len() == 1) { return true; }
+    return ds_ends_at(ps, k, i + 1);
+}
+
+// Run a script in the browser: a <script> appended to the body, removed
+// once it has run unless `auto_remove` is off. `attributes` are written
+// into the tag as given (`type="module"`; `ds_attr` quotes one).
+pub Str ds_execute_script(Str script, Bool auto_remove = true, List(Str) attributes = [], Str event_id = "", Int retry_ms = 1000) {
+    Str rm = if (auto_remove) { " data-effect=\"el.remove()\"" } else { "" };
+    Str attrs = ds_attr_text(attributes, 0, StrBuf());
+    Str tag = "<script" + attrs + rm + ">" + script + "</script>";
+    return ds_patch_elements(tag, selector = "body", mode = ModeAppend, event_id = event_id, retry_ms = retry_ms);
+}
+
+Str ds_attr_text(List(Str) xs, Int i, StrBuf b) {
+    if (i >= xs.len()) { return b.finish(); }
+    return ds_attr_text(xs, i + 1, b.push(" ").push(xs[i]));
+}
+
+// `name="value"`, the value escaped for an attribute.
+pub Str ds_attr(Str name, Str value) { return name + "=\"" + ds_escape_attr(value) + "\""; }
+
+// ─── Script sugar ───────────────────────────────────────────────────────
+
+// Navigate the page to `url`.
+pub Str ds_redirect(Str url, Str event_id = "", Int retry_ms = 1000) {
+    return ds_execute_script("setTimeout(() => window.location = " + ds_json_str(url) + ")", event_id = event_id, retry_ms = retry_ms);
+}
+
+// Replace the address bar's URL without navigating.
+pub Str ds_replace_url(Str url, Str event_id = "", Int retry_ms = 1000) {
+    return ds_execute_script("window.history.replaceState({}, \"\", " + ds_json_str(url) + ")", event_id = event_id, retry_ms = retry_ms);
+}
+
+// Log to the browser console.
+pub Str ds_console_log(Str message, Str event_id = "", Int retry_ms = 1000) {
+    return ds_execute_script("console.log(" + ds_json_str(message) + ")", event_id = event_id, retry_ms = retry_ms);
+}
+
+pub Str ds_console_error(Str message, Str event_id = "", Int retry_ms = 1000) {
+    return ds_execute_script("console.error(" + ds_json_str(message) + ")", event_id = event_id, retry_ms = retry_ms);
+}
+
+// Dispatch a CustomEvent named `name` with `detail_json` as its detail,
+// on the elements `selector` matches (the document when empty).
+pub Str ds_dispatch_event(Str name, Str detail_json, Str selector = "", Bool bubbles = true, Bool cancelable = true, Bool composed = true, Str event_id = "", Int retry_ms = 1000) {
+    Str targets = if (selector == "") { "[document]" } else { "document.querySelectorAll(" + ds_json_str(selector) + ")" };
+    Str init = f"{{bubbles: {bubbles}, cancelable: {cancelable}, composed: {composed}, detail: " + detail_json + "}";
+    Str js = "const e = new CustomEvent(" + ds_json_str(name) + ", " + init + "); " + targets + ".forEach(t => t.dispatchEvent(e))";
+    return ds_execute_script(js, event_id = event_id, retry_ms = retry_ms);
+}
+
+// An SSE comment: keeps an idle stream open through proxies.
+pub Str ds_keepalive() { return ":\n\n"; }
+
+// ─── Replies ────────────────────────────────────────────────────────────
+
+// The head of an event stream. Connection is the writer's to set.
+pub List(Str) ds_headers() { return ["Content-Type: text/event-stream", "Cache-Control: no-cache"]; }
+
+// Every event at once, then the reply ends.
+pub HttpReply ds_reply(List(Str) events) {
+    return HttpReply { .status = 200, .headers = ds_headers(), .body = http_bytes(str_join(events, "")) };
+}
+
+// A step of a stream: events now, and the next step after `wait_ms`.
+pub HttpStep(K) ds_step(K state, List(Str) events, Int wait_ms) {
+    return http_step(state, http_bytes(str_join(events, "")), wait_ms);
+}
+
+// The last step: these events, then the stream ends.
+pub HttpStep(K) ds_end(K state, List(Str) events) {
+    return http_step_end(state, http_bytes(str_join(events, "")));
+}
+
+// A stream: `events` now, then `next(state)` after `wait_ms`, and so on
+// from each step it returns. Serve it with `http_stream_loop`.
+pub HttpOut(K) ds_stream(K state, List(Str) events, Int wait_ms, HttpStep(K) closure(K) next) {
+    HttpStream(K) s = HttpStream { .status = 200, .headers = ds_headers(), .first = ds_step(state, events, wait_ms), .next = next };
+    return Stream(s);
+}
+
+// ─── Reading signals ────────────────────────────────────────────────────
+
+// Was the request sent by Datastar (`Datastar-Request: true`)?
+pub Bool ds_is_request(HttpRequest r) { return http_header(r, "datastar-request") == "true"; }
+
+// The signals' JSON: GET and DELETE carry it in the `datastar` query
+// parameter, every other method in the body.
+pub Result(Str, Str) ds_signals_json(HttpRequest r) {
+    if (r.method == "GET" || r.method == "DELETE" || r.method == "HEAD") {
+        Str q = http_query_param(r.query, "datastar");
+        if (q == "") { return Err("no datastar query parameter"); }
+        return Ok(q);
+    }
+    Str body = http_body_text(r);
+    if (str_trim(body) == "") { return Err("no signals in the request body"); }
+    return Ok(body);
+}
+
+// The signals, decoded into `T`: a record with a JSON decoding, or a
+// `Value` for whatever the page sent.
+@needs(Decode(T, JsonDec))
+pub Result(T, Str) ds_read_signals(HttpRequest r) {
+    Str text = ds_signals_json(r)?;
+    Result(T, SerialError) got = from_json(text);
+    return match got { Ok(v) => Ok(v), Err(e) => Err("invalid signals: " + error_text(e)) };
+}
+
+// The signals as a Value tree.
+pub Result(Value, Str) ds_read_signals_value(HttpRequest r) {
+    Result(Value, Str) v = ds_read_signals(r);
+    return v;
+}
+
+// A signal by its dotted path (`"user.name"`) in a Value tree.
+pub Option(Value) ds_signal(Value signals, Str path) {
+    return ds_walk(signals, str_split(path, "."), 0);
+}
+
+Option(Value) ds_walk(Value v, List(Str) keys, Int i) {
+    if (i >= keys.len()) { return Some(v); }
+    Option(Value) f = value_field(v, keys[i]);
+    return match f { Some(x) => ds_walk(x, keys, i + 1), None => None };
+}
+
+// A signal's text: a string as it is, a number or boolean as JSON
+// writes it, "" when absent or null.
+pub Str ds_signal_text(Value signals, Str path) {
+    Option(Value) v = ds_signal(signals, path);
+    return match v { Some(x) => ds_value_text(x), None => "" };
+}
+
+pub Str ds_value_text(Value v) {
+    return match v {
+        VStr(s) => s, VUnit => "", VNone => "",
+        _ => ds_json_of(v)
+    };
+}
+
+// A Value as compact JSON ("null" if it cannot be written).
+pub Str ds_json_of(Value v) {
+    Result(Str, SerialError) t = to_json(v);
+    return t else { "null" };
+}
+
+// An integer signal, or `fallback` when absent or not a whole number
+// (a numeric string counts: inputs bind text).
+pub Int ds_signal_int(Value signals, Str path, Int fallback) {
+    Str t = str_trim(ds_signal_text(signals, path));
+    return if (str_is_int(t)) { str_parse_int(t) } else { fallback };
+}
+
+pub Bool ds_signal_bool(Value signals, Str path) {
+    Option(Value) v = ds_signal(signals, path);
+    return match v { Some(x) => match x { VBool(b) => b, _ => false }, None => false };
+}
+
+// ─── Text ───────────────────────────────────────────────────────────────
+
+// A JSON string literal (also a JavaScript one).
+pub Str ds_json_str(Str s) {
+    Result(Str, SerialError) t = to_json(s);
+    return t else { "\"\"" };
+}
+
+// Text for an HTML element body: & < > escaped.
+pub Str ds_escape_html(Str s) {
+    return str_replace(str_replace(str_replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;");
+}
+
+// Text for a double-quoted attribute value.
+pub Str ds_escape_attr(Str s) { return str_replace(ds_escape_html(s), "\"", "&quot;"); }
+
+// ─── The client ─────────────────────────────────────────────────────────
+
+// Where `ds_client_reply` is meant to be served.
+pub Str ds_client_path() { return "/datastar@" + ds_client_version() + ".js"; }
+
+// The embedded client bundle. Its path names its version, so it can be
+// cached for good.
+pub HttpReply ds_client_reply() {
+    HttpReply r = http_reply_text(200, "text/javascript; charset=utf-8", ds_client_js());
+    return http_with_header(http_with_header(r, "Cache-Control", "public, max-age=31536000, immutable"), "ETag", "\"" + ds_client_sha256() + "\"");
+}
+
+// A module script tag loading the client from `src` (this server's copy).
+pub Str ds_script_tag(Str src = "") {
+    Str at = if (src == "") { ds_client_path() } else { src };
+    return "<script type=\"module\" src=\"" + ds_escape_attr(at) + "\"></script>";
+}
+
+// The client from the jsDelivr CDN, pinned by its integrity hash: the
+// same bytes as the embedded copy, or the browser refuses them.
+pub Str ds_cdn_url() { return "https://cdn.jsdelivr.net/gh/starfederation/datastar@v" + ds_client_version() + "/bundles/datastar.js"; }
+
+pub Str ds_cdn_script_tag() {
+    return "<script type=\"module\" src=\"" + ds_cdn_url() + "\" integrity=\"" + ds_client_integrity() + "\" crossorigin=\"anonymous\"></script>";
+}

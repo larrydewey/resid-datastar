@@ -1,0 +1,66 @@
+// Every event the SDK writes, field by field, against the text of the
+// specification (sdk/ADR.md) and the sugar built on it.
+import "../src/datastar.resid";
+import "check.resid";
+
+Int main() {
+    List(Bool) r = [
+        check("send minimal", ds_send("x", []), "event: x\n\n"),
+        check("send id retry data", ds_send("x", ["a", "b"], event_id = "7", retry_ms = 2000), "event: x\nid: 7\nretry: 2000\ndata: a\ndata: b\n\n"),
+        check("send default retry omitted", ds_send("x", ["a"], retry_ms = 1000), "event: x\ndata: a\n\n"),
+        check("send id line break dropped", ds_send("x", [], event_id = "a\nb"), "event: x\nid: ab\n\n"),
+        check("patch minimal", ds_patch_elements("<div id=\"feed\"><span>1</span></div>"),
+            "event: datastar-patch-elements\ndata: elements <div id=\"feed\"><span>1</span></div>\n\n"),
+        check("patch all options", ds_patch_elements("<div id=\"feed\">\n    <span>1</span>\n</div>", selector = "#feed", mode = ModeInner,
+                use_view_transition = true, view_transition_selector = "#main", namespace = NsHtml, event_id = "123", retry_ms = 2000),
+            "event: datastar-patch-elements\nid: 123\nretry: 2000\ndata: selector #feed\ndata: mode inner\ndata: useViewTransition true\ndata: viewTransitionSelector #main\ndata: elements <div id=\"feed\">\ndata: elements     <span>1</span>\ndata: elements </div>\n\n"),
+        check("patch transition selector needs transition", ds_patch_elements("<p id=\"a\"></p>", view_transition_selector = "#main"),
+            "event: datastar-patch-elements\ndata: elements <p id=\"a\"></p>\n\n"),
+        check("patch svg", ds_patch_elements("<circle id=\"c1\"/>", selector = "#vis", mode = ModeAppend, namespace = NsSvg),
+            "event: datastar-patch-elements\ndata: selector #vis\ndata: mode append\ndata: namespace svg\ndata: elements <circle id=\"c1\"/>\n\n"),
+        check("patch crlf lines", ds_patch_elements("<a id=\"x\">\r\n</a>"), "event: datastar-patch-elements\ndata: elements <a id=\"x\">\ndata: elements </a>\n\n"),
+        check("modes round trip", ds_mode_name(ds_mode_of("prepend") else { ModeOuter }) + ds_mode_name(ds_mode_of("before") else { ModeOuter }) + ds_mode_name(ds_mode_of("nope") else { ModeReplace }), "prependbeforereplace"),
+        check("namespace mathml", ds_namespace_name(ds_namespace_of("mathml") else { NsHtml }), "mathml"),
+        check("remove", ds_remove_elements("#feed, #otherid"), "event: datastar-patch-elements\ndata: selector #feed, #otherid\ndata: mode remove\n\n"),
+        check("signals minimal", ds_patch_signals("{\"output\":\"x\",\"show\":true}"), "event: datastar-patch-signals\ndata: signals {\"output\":\"x\",\"show\":true}\n\n"),
+        check("signals all options", ds_patch_signals("{\"a\":1}", only_if_missing = true, event_id = "123", retry_ms = 2000),
+            "event: datastar-patch-signals\nid: 123\nretry: 2000\ndata: onlyIfMissing true\ndata: signals {\"a\":1}\n\n"),
+        check("signals multiline", ds_patch_signals("{\n\"a\": 1\n}"), "event: datastar-patch-signals\ndata: signals {\ndata: signals \"a\": 1\ndata: signals }\n\n"),
+        check("signals of a value", ds_patch_signals_of([1, 2, 3]) else { "" }, "event: datastar-patch-signals\ndata: signals [1,2,3]\n\n"),
+        check("null patch nests", ds_null_patch(["user.name", "user.email", "show", "user.prefs.theme"]), "{\"user\":{\"name\":null,\"email\":null,\"prefs\":{\"theme\":null}},\"show\":null}"),
+        check("null patch whole key wins", ds_null_patch(["a.b", "a"]), "{\"a\":null}"),
+        check("remove signals", ds_remove_signals(["one"], event_id = "e"), "event: datastar-patch-signals\nid: e\ndata: signals {\"one\":null}\n\n"),
+        check("script defaults", ds_execute_script("console.log('Here')"),
+            "event: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script data-effect=\"el.remove()\">console.log('Here')</script>\n\n"),
+        check("script options", ds_execute_script("go()", auto_remove = false, attributes = ["type=\"module\"", ds_attr("data-x", "a\"b")], event_id = "1", retry_ms = 5),
+            "event: datastar-patch-elements\nid: 1\nretry: 5\ndata: selector body\ndata: mode append\ndata: elements <script type=\"module\" data-x=\"a&quot;b\">go()</script>\n\n"),
+        check("redirect", ds_redirect("/a\"b"), "event: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script data-effect=\"el.remove()\">setTimeout(() => window.location = \"/a\\\"b\")</script>\n\n"),
+        check("replace url", ds_replace_url("/x"), "event: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script data-effect=\"el.remove()\">window.history.replaceState({}, \"\", \"/x\")</script>\n\n"),
+        check("console", ds_console_log("hi") + ds_console_error("no"), "event: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script data-effect=\"el.remove()\">console.log(\"hi\")</script>\n\nevent: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script data-effect=\"el.remove()\">console.error(\"no\")</script>\n\n"),
+        check("dispatch", ds_dispatch_event("saved", "{\"id\":1}", selector = "#f", composed = false),
+            "event: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script data-effect=\"el.remove()\">const e = new CustomEvent(\"saved\", {bubbles: true, cancelable: true, composed: false, detail: {\"id\":1}}); document.querySelectorAll(\"#f\").forEach(t => t.dispatchEvent(e))</script>\n\n"),
+        check("keepalive", ds_keepalive(), ":\n\n"),
+        check("escape html", ds_escape_html("<a & b>"), "&lt;a &amp; b&gt;"),
+        check("json string", ds_json_str("a\"\n\\"), "\"a\\\"\\n\\\\\""),
+        check("reply head", str_join(ds_reply([ds_keepalive()]).headers, "|"), "Content-Type: text/event-stream|Cache-Control: no-cache"),
+        check("reply body", body_text(ds_reply([ds_send("a", []), ds_send("b", [])])), "event: a\n\nevent: b\n\n"),
+        check("client version", ds_client_version(), "1.0.4"),
+        check("client bytes", str_sha256(ds_client_js()), ds_client_sha256()),
+        check("client head line", str_slice(ds_client_js(), 0, 16), "// Datastar v1.0"),
+        check("client path", ds_client_path(), "/datastar@1.0.4.js"),
+        check("script tag", ds_script_tag(), "<script type=\"module\" src=\"/datastar@1.0.4.js\"></script>"),
+        check("cdn tag", ds_cdn_script_tag(), "<script type=\"module\" src=\"https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.4/bundles/datastar.js\" integrity=\"" + ds_client_integrity() + "\" crossorigin=\"anonymous\"></script>"),
+        check("client reply", http_header_value_of(ds_client_reply().headers, "Cache-Control"), "public, max-age=31536000, immutable")
+    ];
+    return status(r, 0);
+}
+
+Str body_text(HttpReply r) { return http_text(r.body, 0, r.body.len()); }
+
+Str http_header_value_of(List(Str) hs, Str name) { return header_at(hs, name + ": ", 0); }
+
+Str header_at(List(Str) hs, Str prefix, Int i) {
+    if (i >= hs.len()) { return ""; }
+    if (str_starts_with(hs[i], prefix)) { return str_slice(hs[i], str_len(prefix), str_len(hs[i])); }
+    return header_at(hs, prefix, i + 1);
+}

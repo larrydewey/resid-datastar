@@ -1,0 +1,53 @@
+// Reading signals: where each method carries them, decoding into a Value
+// and into a typed value, lookups by path, and the refusals.
+import "../src/datastar.resid";
+import "../../resid-serial/src/value.resid";
+import "check.resid";
+
+HttpRequest req(Str method, Str query, Str body, Bool datastar) {
+    Map(Str, Str) none = {};
+    Map(Str, Str) hs = if (datastar) { none.insert("datastar-request", "true") } else { none };
+    return HttpRequest { .method = method, .target = "/x?" + query, .path = "/x", .query = query, .version = "HTTP/1.1",
+        .headers = hs, .body = http_bytes(body), .keep_alive = true, .ok = true, .status = 0 };
+}
+
+Str read_text(HttpRequest r) {
+    Result(Value, Str) v = ds_read_signals_value(r);
+    return match v { Ok(x) => ds_json_of(x), Err(e) => "error: " + e };
+}
+
+Str ints(HttpRequest r) {
+    Result(List(Int), Str) v = ds_read_signals(r);
+    return match v { Ok(xs) => f"{xs}", Err(e) => "error: " + e };
+}
+
+Value signals_of(Str json) {
+    Result(Value, Str) v = ds_read_signals_value(req("POST", "", json, true));
+    return v else { VUnit };
+}
+
+Int main() {
+    Str q = "datastar=%7B%22user%22%3A%7B%22name%22%3A%22Ada%20L%22%2C%22age%22%3A36%7D%2C%22on%22%3Atrue%7D";
+    Value s = signals_of("{\"user\":{\"name\":\"Ada\",\"age\":\"41\",\"tags\":[1,2]},\"on\":true,\"off\":false,\"n\":7,\"x\":null}");
+    List(Bool) r = [
+        check("get query", read_text(req("GET", q, "", true)), "{\"user\":{\"name\":\"Ada L\",\"age\":36},\"on\":true}"),
+        check("delete query", read_text(req("DELETE", q, "", true)), "{\"user\":{\"name\":\"Ada L\",\"age\":36},\"on\":true}"),
+        check("post body", read_text(req("POST", q, "{\"a\": [1, 2]}", true)), "{\"a\":[1,2]}"),
+        check("put body", read_text(req("PUT", "", "{\"a\":1}", true)), "{\"a\":1}"),
+        check("patch body", read_text(req("PATCH", "", "{\"a\":\"b\"}", true)), "{\"a\":\"b\"}"),
+        check("get without parameter", read_text(req("GET", "other=1", "", true)), "error: no datastar query parameter"),
+        check("post without body", read_text(req("POST", "", "  ", true)), "error: no signals in the request body"),
+        check("invalid json", str_starts_with(read_text(req("POST", "", "{\"a\":", true)), "error: invalid signals: "), true),
+        check("typed", ints(req("POST", "", "[3, 1, 2]", true)), "[3, 1, 2]"),
+        check("typed mismatch", str_starts_with(ints(req("POST", "", "{\"a\":1}", true)), "error: invalid signals"), true),
+        check("is request", f"{ds_is_request(req("GET", "", "", true))} {ds_is_request(req("GET", "", "", false))}", "true false"),
+        check("path text", ds_signal_text(s, "user.name"), "Ada"),
+        check("path number", ds_signal_text(s, "n"), "7"),
+        check("path array", ds_signal_text(s, "user.tags"), "[1,2]"),
+        check("path missing", ds_signal_text(s, "user.nope.deeper"), ""),
+        check("path null", ds_signal_text(s, "x"), ""),
+        check("int from text", f"{ds_signal_int(s, "user.age", -1)} {ds_signal_int(s, "n", -1)} {ds_signal_int(s, "user.name", -1)}", "41 7 -1"),
+        check("bool", f"{ds_signal_bool(s, "on")} {ds_signal_bool(s, "off")} {ds_signal_bool(s, "n")}", "true false false")
+    ];
+    return status(r, 0);
+}

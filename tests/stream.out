@@ -1,0 +1,9 @@
+ok stream status
+ok stream type
+ok stream cache
+ok stream chunked
+ok stream events
+ok client served
+ok client type
+ok connections
+exit 0

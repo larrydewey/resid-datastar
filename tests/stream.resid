@@ -1,0 +1,76 @@
+// A Datastar stream served by the event loop: a counter that patches an
+// element every 20 ms and ends, read back over a socket and decoded from
+// its chunks; then the client bundle from the same server.
+import "../src/datastar.resid";
+import "http.resid";
+import "check.resid";
+
+HttpStep(Int) counter(Int n) {
+    Str ev = ds_patch_elements(f"<b id=\"n\">{n}</b>", event_id = f"{n}");
+    if (n >= 3) { return ds_end(n, [ev, ds_patch_signals("{\"done\":true}")]); }
+    return ds_step(n + 1, [ev], 20);
+}
+
+HttpOut(Int) handle(HttpRequest r) {
+    if (r.path == ds_client_path()) { return Whole(ds_client_reply()); }
+    if (r.path == "/count") { return ds_stream(1, [ds_patch_signals("{\"done\":false}")], 20, lambda(n) { counter(n) }); }
+    return Whole(http_reply_status(404));
+}
+
+@requires(network)
+Str chunked(Int fd, StrBuf acc) {
+    Str line = str_trim(http_recv_line(fd));
+    Int n = hex(line, 0, 0);
+    if (n <= 0) {
+        _ = http_recv_line(fd);
+        return acc.finish();
+    }
+    Str part = http_recv_count(fd, n);
+    _ = http_recv_line(fd);
+    return chunked(fd, acc.push(part));
+}
+
+Int hex(Str s, Int i, Int acc) {
+    if (i >= str_len(s)) { return if (i == 0) { -1 } else { acc }; }
+    Int c = str_char_at(s, i);
+    Int d = if (c >= 48 && c <= 57) { c - 48 } else { if (c >= 97 && c <= 102) { c - 87 } else { -1 } };
+    if (d < 0) { return -1; }
+    return hex(s, i + 1, acc * 16 + d);
+}
+
+@requires(network)
+Int main() {
+    Int lfd = http_listen(0);
+    if (lfd < 0) { println("listen failed"); return 1; }
+    Int port = http_bound_port(lfd);
+    HttpOut(Int) closure(HttpRequest) h = lambda(r) { handle(r) };
+    Result(Int, RegionError) worker = spawn (network(readonly)) {
+        return http_stream_loop(lfd, h, http_limits(), 1);
+    };
+    Int fd = resid_tcp_connect("127.0.0.1", port);
+    _ = resid_tcp_send(fd, "GET /count HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n");
+    Str head = http_recv_head(fd);
+    Str body = chunked(fd, StrBuf());
+    _ = resid_tcp_send(fd, "GET " + ds_client_path() + " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    Str js = resid_tcp_recv_all(fd);
+    _ = resid_tcp_close(fd);
+    Int at = str_index_of(js, "\r\n\r\n", 0);
+    Str served = str_slice(js, at + 4, str_len(js));
+    Int got = worker else { -1 };
+    List(Bool) r = [
+        check("stream status", str_slice(head, 9, 12), "200"),
+        check("stream type", http_header_value(head, "content-type"), "text/event-stream"),
+        check("stream cache", http_header_value(head, "cache-control"), "no-cache"),
+        check("stream chunked", http_header_value(head, "transfer-encoding"), "chunked"),
+        check("stream events", body,
+            ds_patch_signals("{\"done\":false}")
+            + ds_patch_elements("<b id=\"n\">1</b>", event_id = "1")
+            + ds_patch_elements("<b id=\"n\">2</b>", event_id = "2")
+            + ds_patch_elements("<b id=\"n\">3</b>", event_id = "3")
+            + ds_patch_signals("{\"done\":true}")),
+        check("client served", str_sha256(served), ds_client_sha256()),
+        check("client type", http_header_value(js, "content-type"), "text/javascript; charset=utf-8"),
+        check("connections", got, 1)
+    ];
+    return status(r, 0);
+}

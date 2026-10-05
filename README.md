@@ -1,0 +1,141 @@
+# resid-datastar
+
+A [Datastar](https://data-star.dev) server SDK for Resid, and a web UI for
+a resid package registry built with it.
+
+Datastar drives a page from the server: the browser sends its signals as
+JSON, the server answers with server-sent events that patch elements and
+signals. This package implements the SDK specification
+([`sdk/ADR.md`](https://github.com/starfederation/datastar/blob/v1.0.4/sdk/ADR.md))
+over `lib/httpserv.resid`, passes Datastar's own SDK test suite, and embeds
+the v1.0.4 client so a server needs no file or CDN to serve it.
+
+```resid
+import "src/datastar.resid";
+
+HttpOut(Int) handle(HttpRequest r) {
+    if (r.path == ds_client_path()) { return Whole(ds_client_reply()); }
+    if (r.path == "/hello") {
+        return Whole(ds_reply([
+            ds_patch_elements("<p id=\"greeting\">Hello from Resid</p>"),
+            ds_patch_signals("{\"seen\": true}")
+        ]));
+    }
+    return Whole(http_reply_status(404));
+}
+```
+
+`examples/counter.resid` is a whole app: signals posted back, patched
+signals and elements, and a stream the server pushes once a second.
+
+## The SDK (`src/datastar.resid`)
+
+| Call | Event |
+|---|---|
+| `ds_patch_elements(html, selector =, mode =, use_view_transition =, view_transition_selector =, namespace =, event_id =, retry_ms =)` | `datastar-patch-elements` |
+| `ds_remove_elements(selector, ...)` | `datastar-patch-elements`, mode `remove` |
+| `ds_patch_signals(json, only_if_missing =, ...)` / `ds_patch_signals_of(value)` | `datastar-patch-signals` |
+| `ds_remove_signals(["user.name", ...])` | a merge patch of nulls |
+| `ds_execute_script(js, auto_remove =, attributes =, ...)` | a `<script>` appended to the body |
+| `ds_redirect`, `ds_replace_url`, `ds_console_log`, `ds_console_error`, `ds_dispatch_event` | script sugar |
+| `ds_send(type, data_lines, event_id =, retry_ms =)` | any event |
+
+Options are named arguments with the protocol's defaults, and only what
+differs from a default is written. Modes are `ModeOuter` (the default),
+`ModeInner`, `ModeReplace`, `ModePrepend`, `ModeAppend`, `ModeBefore`,
+`ModeAfter`, `ModeRemove`; namespaces `NsHtml`, `NsSvg`, `NsMathml`.
+
+An event is its text, so a reply is a list of them:
+
+- `ds_reply(events)` answers whole (`HttpReply`).
+- `ds_stream(state, events, wait_ms, next)` keeps the connection: `events`
+  now, then `next(state)` after `wait_ms`, which returns `ds_step(state2,
+  events2, wait2)` to go on or `ds_end(state2, events2)` to finish. Serve it
+  with `http_stream_loop` (or `tls_stream_loop`); the waits are socket
+  deadlines in the event loop, so a stream costs a descriptor, not a
+  thread, and needs no `clock` grant. A client that goes away ends its
+  stream.
+
+Reading signals: `ds_read_signals(r)` decodes them into any `T` with a JSON
+decoding (a record through resid-derive, a `List(Int)`, ...);
+`ds_read_signals_value(r)` gives a `Value` tree, and `ds_signal`,
+`ds_signal_text`, `ds_signal_int`, `ds_signal_bool` look up dotted paths
+in it. GET and DELETE carry the signals in the `datastar` query parameter,
+other methods in the body, as the specification says; missing or invalid
+JSON is an `Err`. `ds_is_request(r)` checks `Datastar-Request: true`.
+
+The client: `ds_client_reply()` serves the embedded bundle at
+`ds_client_path()` (`/datastar@1.0.4.js`, cached immutably), and
+`ds_script_tag()` loads it. `ds_cdn_script_tag()` loads the same bytes
+from jsDelivr instead, pinned with a subresource-integrity hash.
+
+`ds_escape_html`, `ds_escape_attr`, `ds_attr` and `ds_json_str` are there
+for building markup and scripts safely.
+
+## The registry UI (`ui/registry.resid`)
+
+```sh
+residc ui/registry.resid -o resid-registry-ui
+./resid-registry-ui <registry-dir> [--port 8090] [--pubkey HEX] [--cdn] [--poll-ms 1000]
+```
+
+It reads the directory `resid-pkg publish` writes and serves, on
+127.0.0.1 only and without ever writing:
+
+- **Packages**: every published package, searched as you type, with the
+  index's state (verified against `--pubkey`, signed, unsigned, absent, or
+  a bad signature) and archives the index does not list.
+- **A package**: its versions, newest first. A version shows the hash the
+  registry records against the archive's actual SHA-256, its signature
+  checked against the key, a download link, and its files; `resid.toml`
+  opens by default and any other file opens in place.
+- **Live**: every page holds one stream that watches the registry. When a
+  publish (or a removal, or a re-signed index) changes it, the page fetches
+  what changed with its current search, without a reload. The header shows
+  whether the stream is connected.
+
+Names, versions and file paths are checked or percent-encoded before they
+reach a path or a script, and everything shown is escaped.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `src/datastar.resid` | the SDK |
+| `src/client.resid` | the client bundle embedded, generated by `tools/embed_client.py` |
+| `assets/datastar.js` | Datastar v1.0.4's bundle, unmodified (`assets/DATASTAR-LICENSE.md`, MIT) |
+| `ui/registry.resid` | the registry UI |
+| `examples/counter.resid` | a complete small app |
+| `tests/` | the suites, below |
+
+## Tests
+
+```sh
+tests/run.sh             # RESIDC=/path/to/residc to pick the compiler
+tests/run.sh --update    # rewrite the golden .out files
+```
+
+- `events`, `signals`, `stream`: golden checks of every event and option
+  against the specification's text, signal reading for each method and its
+  refusals, and a stream served by the real event loop.
+- `spec`: Datastar's own SDK suite (`tests/spec`, from `sdk/test` at
+  v1.0.4, run with curl, awk and sh) against `tests/sdk_server.resid`;
+  each case is counted.
+- `ui`: the registry UI against a registry built with `resid-pkg`: pages,
+  search, verification, a tampered archive, a wrong key, downloads,
+  traversal refusals, the live stream; and, when node and chromium are
+  installed, `tests/browser.mjs` drives it in headless Chromium (typing,
+  a live publish, clicking through files).
+
+## Requirements
+
+Checkouts of [resid-json](https://github.com/larrydewey/resid-json) and
+[resid-serial](https://github.com/larrydewey/resid-serial) beside this one
+(the imports are relative), and a Resid compiler with streamed replies in
+`lib/httpserv.resid` (`HttpOut`, `http_stream_loop`). The UI tests build
+`tools/resid-pkg.resid` from a resid checkout beside this one
+(`RESID_SRC` overrides).
+
+To move to a newer Datastar, replace `assets/datastar.js` and
+`assets/DATASTAR-LICENSE.md`, run `tools/embed_client.py`, and update the
+version in the tests.
