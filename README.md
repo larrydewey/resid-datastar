@@ -80,7 +80,8 @@ Content-Security-Policy without `'unsafe-inline'`, give the script a nonce
 ## The registry UI (`ui/registry.resid`)
 
 ```sh
-residc ui/registry.resid -o resid-registry-ui
+resid-manifest depmap resid.toml deps.txt
+residc ui/registry.resid -o resid-registry-ui -depmap deps.txt
 ./resid-registry-ui <registry-dir> [--port 8090] [--pubkey HEX] [--cdn] [--poll-ms 1000]
 ```
 
@@ -169,10 +170,12 @@ tests/run.sh --update    # rewrite the golden .out files
 
 ## Requirements
 
-Checkouts of [resid-json](https://github.com/larrydewey/resid-json),
+[resid-json](https://github.com/larrydewey/resid-json),
 [resid-serial](https://github.com/larrydewey/resid-serial) and resid-toml
-(for the UI's manifests) beside this one
-(the imports are relative), and a Resid compiler with streamed replies in
+(for the UI's manifests), as `resid.toml` dependencies: checkouts beside
+this one, or a registry. The sources import them by package name
+(`import "resid-json/json.resid";`), so builds go through `resid-manifest`
+(or `residc -depmap` with the map it writes). And a Resid compiler with streamed replies in
 `lib/httpserv.resid` (`HttpOut`, `http_stream_loop`). The UI tests build
 `tools/resid-pkg.resid` from a resid checkout beside this one
 (`RESID_SRC` overrides).

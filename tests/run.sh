@@ -13,17 +13,22 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RESIDC="${RESIDC:-$(command -v residc || echo "$HOME/.resid/bin/residc")}"
+# resid-manifest writes the dependency map that `import "pkg/m.resid"` reads.
+MANIFEST="${MANIFEST:-$(command -v resid-manifest || echo "$HOME/.resid/bin/resid-manifest")}"
 UPDATE=0
 [ "${1:-}" = "--update" ] && UPDATE=1
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"; kill $(jobs -p) 2>/dev/null' EXIT
+"$MANIFEST" depmap "$ROOT/resid.toml" "$WORK/depmap" > "$WORK/depmap.log" 2>&1 || {
+    cat "$WORK/depmap.log"; echo "FAIL resid-manifest depmap"; exit 1;
+}
 export RESID_MEM_LIMIT="${RESID_MEM_LIMIT:-6000}"
 
 pass=0
 fail=0
 
 compile() { # compile <src> <out-bin>
-    "$RESIDC" "$1" -o "$2" --profile debug > "$WORK/compile.log" 2>&1 || {
+    "$RESIDC" "$1" -o "$2" --profile debug -depmap "$WORK/depmap" > "$WORK/compile.log" 2>&1 || {
         grep -v '^OK \|^note:\|^typecheck OK\|^wrote ' "$WORK/compile.log" | head -20
         return 1
     }

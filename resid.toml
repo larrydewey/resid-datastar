@@ -1,6 +1,7 @@
 [package]
 name = "resid-datastar"
 version = "0.1.0"
+root = "src/datastar.resid"
 description = "A Datastar server SDK for Resid, and a live web UI for package registries"
 license = "MIT"
 repository = "https://github.com/larrydewey/resid-datastar"
@@ -11,15 +12,17 @@ repository = "https://github.com/larrydewey/resid-datastar"
 [capabilities]
 grant = []
 
-# JSON for the signals. src/datastar.resid imports
-# ../../resid-json/src/json.resid and ../../resid-serial/src/value.resid,
-# so checkouts beside this one work as they are.
+# JSON for the signals. src/datastar.resid imports them by package name
+# (`import "resid-json/json.resid";`), resolved through these entries.
 [dependencies.resid-json]
 path = "../resid-json"
+version = "0.1.0"
 
 [dependencies.resid-serial]
 path = "../resid-serial"
+version = "0.1.0"
 
 # The registry UI reads manifests through resid-toml.
 [dependencies.resid-toml]
 path = "../resid-toml"
+version = "0.1.0"

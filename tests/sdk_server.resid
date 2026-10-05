@@ -5,7 +5,7 @@
 //   sdk_server --port-file F [--port N] [--requests N]
 
 import "../src/datastar.resid";
-import "../../resid-serial/src/value.resid";
+import "resid-serial/value.resid";
 
 Str field_text(Value ev, Str name) { return ds_signal_text(ev, name); }
 

@@ -5,8 +5,8 @@
 // capability ceiling.
 
 import "../src/datastar.resid";
-import "../../resid-toml/src/toml.resid";
-import "../../resid-serial/src/value.resid";
+import "resid-toml/toml.resid";
+import "resid-serial/value.resid";
 
 // One dependency. `version` names a registry release, `path` local
 // source; `caps` is the ceiling it runs under, when `has_caps`.
