@@ -36,7 +36,7 @@ else
     echo "FAIL src/client.resid is stale: run tools/embed_client.py"; fail=$((fail + 1))
 fi
 
-for src in events signals stream; do
+for src in events signals stream markdown ui_parts; do
     want="$ROOT/tests/$src.out"
     bin="$WORK/$src"
     if ! compile "$ROOT/tests/$src.resid" "$bin"; then

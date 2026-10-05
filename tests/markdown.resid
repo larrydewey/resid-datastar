@@ -1,0 +1,38 @@
+// The Markdown renderer: each block and inline form, and that nothing in
+// the text becomes markup or a script URL.
+import "../ui/markdown.resid";
+import "check.resid";
+
+Str md(Str s) { return md_html(s, "/raw/p/1/"); }
+
+Int main() {
+    List(Bool) r = [
+        check("heading", md("# Title *x*\n## Two ##"), "<h1 id=\"title-x\">Title <em>x</em></h1>\n<h2 id=\"two\">Two</h2>\n"),
+        check("setext", md("Big\n===\nSmall\n---"), "<h1 id=\"big\">Big</h1>\n<h2 id=\"small\">Small</h2>\n"),
+        check("paragraphs", md("one\ntwo\n\nthree"), "<p>one\ntwo</p>\n<p>three</p>\n"),
+        check("hard break", md("a  \nb"), "<p>a<br>\nb</p>\n"),
+        check("emphasis", md("*a* **b** _c_ __d__ ~~e~~ snake_case_name"), "<p><em>a</em> <strong>b</strong> <em>c</em> <strong>d</strong> <del>e</del> snake_case_name</p>\n"),
+        check("code span", md("use `a < b` and `` x`y ``"), "<p>use <code>a &lt; b</code> and <code>x`y</code></p>\n"),
+        check("fenced", md("```resid\nInt x = 1 < 2;\n```"), "<pre><code class=\"language-resid\">Int x = 1 &lt; 2;</code></pre>\n"),
+        check("fence unclosed", md("~~~\nopen"), "<pre><code>open</code></pre>\n"),
+        check("indented code", md("    a\n    b\n\nc"), "<pre><code>a\nb</code></pre>\n<p>c</p>\n"),
+        check("bullets", md("- a\n- b\n  - c\n- d"), "<ul>\n<li>a</li>\n<li>b\n<ul>\n<li>c</li>\n</ul>\n</li>\n<li>d</li>\n</ul>\n"),
+        check("ordered", md("3. x\n4. y"), "<ol start=\"3\">\n<li>x</li>\n<li>y</li>\n</ol>\n"),
+        check("loose list", md("- a\n\n- b"), "<ul>\n<li><p>a</p>\n</li>\n<li><p>b</p>\n</li>\n</ul>\n"),
+        check("tasks", md("- [x] done\n- [ ] todo"), "<ul>\n<li><input type=\"checkbox\" checked disabled> done</li>\n<li><input type=\"checkbox\" disabled> todo</li>\n</ul>\n"),
+        check("quote", md("> q *1*\nlazy\n\nafter"), "<blockquote>\n<p>q <em>1</em>\nlazy</p>\n</blockquote>\n<p>after</p>\n"),
+        check("rule", md("a\n\n***\n\nb"), "<p>a</p>\n<hr>\n<p>b</p>\n"),
+        check("table", md("| a | b |\n|:--|--:|\n| 1 | `x\\|y` |\n| 2 |"), "<table><thead><tr><th style=\"text-align:left\">a</th><th style=\"text-align:right\">b</th></tr></thead><tbody><tr><td style=\"text-align:left\">1</td><td style=\"text-align:right\"><code>x|y</code></td></tr><tr><td style=\"text-align:left\">2</td><td style=\"text-align:right\"></td></tr></tbody></table>\n"),
+        check("link", md("[the *docs*](https://x.dev/a \"T\")"), "<p><a href=\"https://x.dev/a\" title=\"T\" rel=\"nofollow noopener\">the <em>docs</em></a></p>\n"),
+        check("relative link", md("[license](./LICENSE) [top](#a) [abs](/x)"), "<p><a href=\"/raw/p/1/LICENSE\" rel=\"nofollow noopener\">license</a> <a href=\"#a\" rel=\"nofollow noopener\">top</a> <a href=\"/x\" rel=\"nofollow noopener\">abs</a></p>\n"),
+        check("script url refused", md("[x](javascript:alert(1)) [y](JaVaScRiPt:1) [z](data:text/html,1)"), "<p><a href=\"#\" rel=\"nofollow noopener\">x</a> <a href=\"#\" rel=\"nofollow noopener\">y</a> <a href=\"#\" rel=\"nofollow noopener\">z</a></p>\n"),
+        check("image as link", md("![logo *x*](img/l.png)"), "<p><a class=\"md-img\" href=\"/raw/p/1/img/l.png\" rel=\"nofollow noopener\">logo x</a></p>\n"),
+        check("autolinks", md("<https://a.b/c> <me@x.org> see https://e.f/g. ok"), "<p><a href=\"https://a.b/c\" rel=\"nofollow noopener\">https://a.b/c</a> <a href=\"mailto:me@x.org\" rel=\"nofollow noopener\">me@x.org</a> see <a href=\"https://e.f/g\" rel=\"nofollow noopener\">https://e.f/g</a>. ok</p>\n"),
+        check("raw html is text", md("<script>alert(1)</script>\n<img src=x onerror=y>"), "<p>&lt;script&gt;alert(1)&lt;/script&gt;\n&lt;img src=x onerror=y&gt;</p>\n"),
+        check("attribute breakout", md("[a](https://x/\"onmouseover=\"y)"), "<p><a href=\"https://x/&quot;onmouseover=&quot;y\" rel=\"nofollow noopener\">a</a></p>\n"),
+        check("escapes", md("\\*not em\\* \\[x\\] 1 \\< 2 & 3"), "<p>*not em* [x] 1 &lt; 2 &amp; 3</p>\n"),
+        check("unmatched", md("a * b ** c [d] (e) `f"), "<p>a * b ** c [d] (e) `f</p>\n"),
+        check("crlf and tabs", md("a\r\n\r\n\tcode"), "<p>a</p>\n<pre><code>code</code></pre>\n")
+    ];
+    return status(r, 0);
+}

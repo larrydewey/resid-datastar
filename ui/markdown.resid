@@ -1,0 +1,607 @@
+// ─── ui/markdown.resid — Markdown to safe HTML ─────────────────────────
+// The CommonMark shapes a package README uses, plus GitHub's tables,
+// strikethrough and bare-URL links. Nothing the text says reaches the
+// page as markup: raw HTML is shown as text, every character is escaped,
+// and a link or image URL is kept only when it is http(s), mailto, an
+// anchor or relative (else it becomes "#"). Relative URLs are resolved
+// against `base`, so a README's `LICENSE` link opens that file.
+//
+//   md_html(text, base)
+
+import "../src/datastar.resid";
+
+pub Str md_html(Str text, Str base) {
+    List(Str) ls = str_split(str_replace(str_replace(text, "\r\n", "\n"), "\t", "    "), "\n");
+    return md_blocks(ls, 0, base, StrBuf());
+}
+
+Str md_esc(Str s) { return ds_escape_html(s); }
+
+// ─── Lines ──────────────────────────────────────────────────────────────
+
+Int md_indent(Str s, Int i) {
+    if (i >= str_len(s) || str_char_at(s, i) != 32) { return i; }
+    return md_indent(s, i + 1);
+}
+
+Bool md_blank(Str s) { return str_trim(s) == ""; }
+
+Str md_ltrim(Str s) { return str_slice(s, md_indent(s, 0), str_len(s)); }
+
+// `s` without its first `n` columns of indentation (fewer if it has less).
+Str md_dedent(Str s, Int n) {
+    Int have = md_indent(s, 0);
+    Int cut = if (have < n) { have } else { n };
+    return str_slice(s, cut, str_len(s));
+}
+
+Int md_run(Str s, Int i, Int c) {
+    if (i >= str_len(s) || str_char_at(s, i) != c) { return i; }
+    return md_run(s, i + 1, c);
+}
+
+// Every character is `c` or a space, and there are at least `n` of `c`.
+Bool md_only(Str s, Int c, Int n) { return md_only_at(s, c, 0, 0) >= n; }
+
+Int md_only_at(Str s, Int c, Int i, Int k) {
+    if (i >= str_len(s)) { return k; }
+    Int x = str_char_at(s, i);
+    if (x == c) { return md_only_at(s, c, i + 1, k + 1); }
+    if (x == 32) { return md_only_at(s, c, i + 1, k); }
+    return -1;
+}
+
+// ATX heading level, 0 when not one.
+Int md_heading(Str s) {
+    if (md_indent(s, 0) > 3) { return 0; }
+    Str t = md_ltrim(s);
+    Int n = md_run(t, 0, 35);
+    if (n < 1 || n > 6) { return 0; }
+    if (n < str_len(t) && str_char_at(t, n) != 32) { return 0; }
+    return n;
+}
+
+Bool md_hr(Str s) {
+    if (md_indent(s, 0) > 3) { return false; }
+    Str t = str_trim(s);
+    return md_only(t, 42, 3) || md_only(t, 45, 3) || md_only(t, 95, 3);
+}
+
+// The fence a line opens ("```" or "~~~" and longer), or "".
+Str md_fence(Str s) {
+    if (md_indent(s, 0) > 3) { return ""; }
+    Str t = md_ltrim(s);
+    Int bt = md_run(t, 0, 96);
+    Int td = md_run(t, 0, 126);
+    if (bt >= 3) { return str_slice(t, 0, bt); }
+    if (td >= 3) { return str_slice(t, 0, td); }
+    return "";
+}
+
+// A list item's marker: its kind (0 none, 1 bullet, 2 ordered), the
+// column its content starts at, and an ordered list's first number.
+type MdMark = { Int kind; Int content; Int start; };
+
+MdMark md_mark(Str s) {
+    Int ind = md_indent(s, 0);
+    MdMark none = MdMark { .kind = 0, .content = 0, .start = 0 };
+    if (ind >= str_len(s)) { return none; }
+    Int c = str_char_at(s, ind);
+    if (c == 45 || c == 42 || c == 43) {
+        if (ind + 1 < str_len(s) && str_char_at(s, ind + 1) != 32) { return none; }
+        if (md_hr(s)) { return none; }
+        Int sp = md_indent(s, ind + 1);
+        Int content = if (sp >= str_len(s) || sp - (ind + 1) > 4) { ind + 2 } else { sp };
+        return MdMark { .kind = 1, .content = content, .start = 0 };
+    }
+    Int d = md_digits(s, ind);
+    if (d == ind || d - ind > 9 || d >= str_len(s)) { return none; }
+    Int p = str_char_at(s, d);
+    if (p != 46 && p != 41) { return none; }
+    if (d + 1 < str_len(s) && str_char_at(s, d + 1) != 32) { return none; }
+    Int sp2 = md_indent(s, d + 1);
+    Int content2 = if (sp2 >= str_len(s) || sp2 - (d + 1) > 4) { d + 2 } else { sp2 };
+    return MdMark { .kind = 2, .content = content2, .start = str_parse_int(str_slice(s, ind, d)) };
+}
+
+Int md_digits(Str s, Int i) {
+    if (i >= str_len(s)) { return i; }
+    Int c = str_char_at(s, i);
+    if (c < 48 || c > 57) { return i; }
+    return md_digits(s, i + 1);
+}
+
+Bool md_quote(Str s) { return md_indent(s, 0) <= 3 && str_starts_with(md_ltrim(s), ">"); }
+
+// A GFM table delimiter row: | :--- | ---: |
+Bool md_table_sep(Str s) {
+    List(Str) cells = md_cells(s);
+    if (cells.len() == 0) { return false; }
+    return md_seps(cells, 0);
+}
+
+Bool md_seps(List(Str) cs, Int i) {
+    if (i >= cs.len()) { return true; }
+    Str c = str_trim(cs[i]);
+    Str core = str_replace(c, ":", "");
+    if (str_len(core) < 1 || !md_only(core, 45, 1)) { return false; }
+    return md_seps(cs, i + 1);
+}
+
+// A table row's cells, the outer pipes dropped; `\|` stays in its cell.
+List(Str) md_cells(Str s) {
+    Str t0 = str_trim(s);
+    Str t1 = if (str_starts_with(t0, "|")) { str_slice(t0, 1, str_len(t0)) } else { t0 };
+    Str t = if (str_ends_with(t1, "|") && !str_ends_with(t1, "\\|")) { str_slice(t1, 0, str_len(t1) - 1) } else { t1 };
+    if (!str_contains(s, "|")) { return []; }
+    List(Str) parts = str_split(str_replace(t, "\\|", str_from_code(1)), "|");
+    return md_unpipe(parts, 0, ListBuf());
+}
+
+List(Str) md_unpipe(List(Str) ps, Int i, ListBuf(Str) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return md_unpipe(ps, i + 1, acc.push(str_replace(ps[i], str_from_code(1), "|")));
+}
+
+// Does this line start a block other than a paragraph?
+Bool md_starts_block(Str s) {
+    return md_heading(s) > 0 || md_hr(s) || md_fence(s) != "" || md_quote(s) || md_mark(s).kind != 0;
+}
+
+// ─── Blocks ─────────────────────────────────────────────────────────────
+
+Str md_blocks(List(Str) ls, Int i, Str base, StrBuf b) {
+    if (i >= ls.len()) { return b.finish(); }
+    Str s = ls[i];
+    if (md_blank(s)) { return md_blocks(ls, i + 1, base, b); }
+    Str fence = md_fence(s);
+    if (fence != "") {
+        Str info = str_trim(str_slice(md_ltrim(s), str_len(fence), str_len(md_ltrim(s))));
+        Str lang = str_split(info, " ")[0];
+        Int ind = md_indent(s, 0);
+        Int end = md_fence_end(ls, i + 1, fence);
+        Str code = md_join_dedent(ls, i + 1, end, ind, StrBuf());
+        Str cls = if (lang == "") { "" } else { " class=\"language-" + ds_escape_attr(lang) + "\"" };
+        Int next = if (end < ls.len()) { end + 1 } else { end };
+        return md_blocks(ls, next, base, b.push("<pre><code" + cls + ">" + md_esc(code) + "</code></pre>\n"));
+    }
+    Int h = md_heading(s);
+    if (h > 0) {
+        Str t = md_ltrim(s);
+        Str body = md_strip_closing(str_trim(str_slice(t, h, str_len(t))));
+        Str tag = f"h{h}";
+        return md_blocks(ls, i + 1, base, b.push("<" + tag + " id=\"" + md_slug(body) + "\">" + md_inline(body, base) + "</" + tag + ">\n"));
+    }
+    if (md_hr(s)) { return md_blocks(ls, i + 1, base, b.push("<hr>\n")); }
+    if (md_quote(s)) {
+        Int end = md_quote_end(ls, i);
+        List(Str) inner = md_unquote(ls, i, end, ListBuf());
+        return md_blocks(ls, end, base, b.push("<blockquote>\n" + md_blocks(inner, 0, base, StrBuf()) + "</blockquote>\n"));
+    }
+    MdMark m = md_mark(s);
+    if (m.kind != 0) { return md_list(ls, i, m, base, b); }
+    if (md_indent(s, 0) >= 4) {
+        Int end = md_indented_end(ls, i);
+        Str code = md_join_dedent(ls, i, end, 4, StrBuf());
+        return md_blocks(ls, end, base, b.push("<pre><code>" + md_esc(md_trim_trailing_newlines(code)) + "</code></pre>\n"));
+    }
+    if (i + 1 < ls.len() && str_contains(s, "|") && md_table_sep(ls[i + 1])) {
+        Int end = md_table_end(ls, i + 2);
+        return md_blocks(ls, end, base, b.push(md_table(ls, i, end, base)));
+    }
+    Int pend = md_para_end(ls, i + 1);
+    // A setext heading: a paragraph underlined with === or ---.
+    Bool setext = pend < ls.len() && (md_only(str_trim(ls[pend]), 61, 1) || md_only(str_trim(ls[pend]), 45, 1)) && md_indent(ls[pend], 0) <= 3;
+    Str text = md_join_lines(ls, i, pend, StrBuf());
+    if (setext) {
+        Str tag2 = if (md_only(str_trim(ls[pend]), 61, 1)) { "h1" } else { "h2" };
+        return md_blocks(ls, pend + 1, base, b.push("<" + tag2 + " id=\"" + md_slug(text) + "\">" + md_inline(text, base) + "</" + tag2 + ">\n"));
+    }
+    return md_blocks(ls, pend, base, b.push("<p>" + md_inline(text, base) + "</p>\n"));
+}
+
+Str md_strip_closing(Str s) {
+    Int n = str_len(s);
+    Int j = md_back_run(s, n - 1, 35);
+    if (j == n - 1) { return s; }
+    if (j < 0) { return ""; }
+    if (str_char_at(s, j) == 32) { return str_trim(str_slice(s, 0, j)); }
+    return s;
+}
+
+Int md_back_run(Str s, Int i, Int c) {
+    if (i < 0 || str_char_at(s, i) != c) { return i; }
+    return md_back_run(s, i - 1, c);
+}
+
+// A heading's anchor: lower case, letters and digits, spaces as dashes.
+Str md_slug(Str s) { return md_slug_at(str_to_lower(s), 0, StrBuf()); }
+
+Str md_slug_at(Str s, Int i, StrBuf b) {
+    if (i >= str_len(s)) { return b.finish(); }
+    Int c = str_char_at(s, i);
+    Bool keep = (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || c == 45 || c == 95;
+    StrBuf next = if (keep) { b.push_char(c) } else { if (c == 32) { b.push("-") } else { b } };
+    return md_slug_at(s, i + 1, next);
+}
+
+Int md_fence_end(List(Str) ls, Int i, Str fence) {
+    if (i >= ls.len()) { return i; }
+    Str t = str_trim(ls[i]);
+    Int c = str_char_at(fence, 0);
+    if (md_indent(ls[i], 0) <= 3 && md_run(t, 0, c) >= str_len(fence) && md_only(t, c, 1)) { return i; }
+    return md_fence_end(ls, i + 1, fence);
+}
+
+Str md_join_dedent(List(Str) ls, Int i, Int end, Int n, StrBuf b) {
+    if (i >= end) { return b.finish(); }
+    Str sep = if (i + 1 < end) { "\n" } else { "" };
+    return md_join_dedent(ls, i + 1, end, n, b.push(md_dedent(ls[i], n)).push(sep));
+}
+
+Str md_trim_trailing_newlines(Str s) {
+    if (str_ends_with(s, "\n")) { return md_trim_trailing_newlines(str_slice(s, 0, str_len(s) - 1)); }
+    return s;
+}
+
+Int md_indented_end(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return i; }
+    if (md_blank(ls[i])) {
+        Int k = md_skip_blank(ls, i);
+        if (k < ls.len() && md_indent(ls[k], 0) >= 4) { return md_indented_end(ls, k); }
+        return i;
+    }
+    if (md_indent(ls[i], 0) < 4) { return i; }
+    return md_indented_end(ls, i + 1);
+}
+
+Int md_skip_blank(List(Str) ls, Int i) {
+    if (i >= ls.len() || !md_blank(ls[i])) { return i; }
+    return md_skip_blank(ls, i + 1);
+}
+
+Int md_quote_end(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return i; }
+    if (md_quote(ls[i])) { return md_quote_end(ls, i + 1); }
+    // A lazy line continues the quote's paragraph.
+    if (!md_blank(ls[i]) && i > 0 && !md_blank(ls[i - 1]) && !md_starts_block(ls[i])) { return md_quote_end(ls, i + 1); }
+    return i;
+}
+
+List(Str) md_unquote(List(Str) ls, Int i, Int end, ListBuf(Str) acc) {
+    if (i >= end) { return acc.finish(); }
+    Str t = md_ltrim(ls[i]);
+    Str inner = if (str_starts_with(t, "> ")) { str_slice(t, 2, str_len(t)) } else { if (str_starts_with(t, ">")) { str_slice(t, 1, str_len(t)) } else { t } };
+    return md_unquote(ls, i + 1, end, acc.push(inner));
+}
+
+Int md_para_end(List(Str) ls, Int i) {
+    if (i >= ls.len() || md_blank(ls[i])) { return i; }
+    Str s = ls[i];
+    if (md_heading(s) > 0 || md_fence(s) != "" || md_quote(s)) { return i; }
+    if (md_only(str_trim(s), 61, 1) || (md_only(str_trim(s), 45, 1) && md_indent(s, 0) <= 3)) { return i; }
+    if (md_hr(s)) { return i; }
+    MdMark m = md_mark(s);
+    // Only a bullet or a list starting at 1 may interrupt a paragraph.
+    if (m.kind == 1 || (m.kind == 2 && m.start == 1)) { return i; }
+    return md_para_end(ls, i + 1);
+}
+
+Str md_join_lines(List(Str) ls, Int i, Int end, StrBuf b) {
+    if (i >= end) { return b.finish(); }
+    Str raw = md_ltrim(ls[i]);
+    Bool hard = str_ends_with(raw, "  ") || str_ends_with(raw, "\\");
+    Str line = if (str_ends_with(raw, "\\")) { str_slice(raw, 0, str_len(raw) - 1) } else { str_trim(raw) };
+    Str sep = if (i + 1 >= end) { "" } else { if (hard) { str_from_code(2) } else { "\n" } };
+    return md_join_lines(ls, i + 1, end, b.push(line).push(sep));
+}
+
+// ─── Lists ──────────────────────────────────────────────────────────────
+
+// One list: items of the same kind until something else starts.
+Str md_list(List(Str) ls, Int i, MdMark first, Str base, StrBuf b) {
+    Str open = if (first.kind == 1) { "<ul>\n" } else { if (first.start == 1) { "<ol>\n" } else { f"<ol start=\"{first.start}\">\n" } };
+    Str close = if (first.kind == 1) { "</ul>\n" } else { "</ol>\n" };
+    MdItems items = md_items(ls, i, first.kind, md_indent(ls[i], 0), base, false, StrBuf());
+    return md_blocks(ls, items.end, base, b.push(open).push(items.html).push(close));
+}
+
+type MdItems = { Str html; Int end; };
+
+MdItems md_items(List(Str) ls, Int i, Int kind, Int ind, Str base, Bool loose, StrBuf b) {
+    MdMark m = if (i < ls.len()) { md_mark(ls[i]) } else { MdMark { .kind = 0, .content = 0, .start = 0 } };
+    if (i >= ls.len() || m.kind != kind || md_indent(ls[i], 0) > ind + 3 || md_indent(ls[i], 0) < ind) {
+        return MdItems { .html = b.finish(), .end = i };
+    }
+    Int end = md_item_end(ls, i + 1, m.content);
+    // The item's lines, its first from where its content starts.
+    List(Str) first = [str_slice(ls[i], if (m.content < str_len(ls[i])) { m.content } else { str_len(ls[i]) }, str_len(ls[i]))];
+    List(Str) body = first.concat(md_dedent_all(ls, i + 1, end, m.content, ListBuf()));
+    // Trailing blank lines belong between items: they make the list loose.
+    Int real_end = md_back_blank(ls, end, i + 1);
+    Bool gap = real_end < end && end < ls.len() && md_mark(ls[end]).kind == kind;
+    Bool inner_gap = md_has_inner_blank(body, 0, real_end - i);
+    Bool is_loose = loose || gap || inner_gap;
+    Str rendered = md_blocks(body, 0, base, StrBuf());
+    Str html = if (is_loose) { rendered } else { md_tighten(rendered) };
+    Str task = md_task(html);
+    return md_items(ls, end, kind, ind, base, is_loose, b.push("<li>" + task + "</li>\n"));
+}
+
+// `[ ]` / `[x]` at an item's start become checkboxes.
+Str md_task(Str html) {
+    if (str_starts_with(html, "[ ] ")) { return "<input type=\"checkbox\" disabled> " + str_slice(html, 4, str_len(html)); }
+    if (str_starts_with(html, "[x] ") || str_starts_with(html, "[X] ")) { return "<input type=\"checkbox\" checked disabled> " + str_slice(html, 4, str_len(html)); }
+    return html;
+}
+
+// A tight item's paragraphs lose their <p>.
+Str md_tighten(Str html) {
+    Str t = str_replace(str_replace(str_replace(html, "<p>", ""), "</p>\n", "\n"), "</p>", "");
+    Bool text_last = str_ends_with(t, "\n") && !str_ends_with(t, ">\n");
+    return if (text_last) { str_slice(t, 0, str_len(t) - 1) } else { t };
+}
+
+Bool md_has_inner_blank(List(Str) body, Int i, Int n) {
+    if (i >= n - 1 || i >= body.len() - 1) { return false; }
+    if (md_blank(body[i]) && i > 0 && !md_blank(body[i + 1])) { return true; }
+    return md_has_inner_blank(body, i + 1, n);
+}
+
+Int md_back_blank(List(Str) ls, Int end, Int floor) {
+    if (end <= floor || !md_blank(ls[end - 1])) { return end; }
+    return md_back_blank(ls, end - 1, floor);
+}
+
+// Where an item whose content starts at column `col` ends: at a line
+// indented less that is not blank and not a lazy paragraph line.
+Int md_item_end(List(Str) ls, Int i, Int col) {
+    if (i >= ls.len()) { return i; }
+    Str s = ls[i];
+    if (md_blank(s)) {
+        Int k = md_skip_blank(ls, i);
+        if (k < ls.len() && md_indent(ls[k], 0) >= col) { return md_item_end(ls, k, col); }
+        return k;
+    }
+    if (md_indent(s, 0) >= col) { return md_item_end(ls, i + 1, col); }
+    Bool lazy = !md_blank(ls[i - 1]) && !md_starts_block(s) && md_indent(ls[i - 1], 0) >= 0;
+    if (lazy) { return md_item_end(ls, i + 1, col); }
+    return i;
+}
+
+List(Str) md_dedent_all(List(Str) ls, Int i, Int end, Int n, ListBuf(Str) acc) {
+    if (i >= end) { return acc.finish(); }
+    return md_dedent_all(ls, i + 1, end, n, acc.push(md_dedent(ls[i], n)));
+}
+
+// ─── Tables ─────────────────────────────────────────────────────────────
+
+Int md_table_end(List(Str) ls, Int i) {
+    if (i >= ls.len() || md_blank(ls[i]) || !str_contains(ls[i], "|") || md_starts_block(ls[i])) { return i; }
+    return md_table_end(ls, i + 1);
+}
+
+Str md_table(List(Str) ls, Int i, Int end, Str base) {
+    List(Str) aligns = md_aligns(md_cells(ls[i + 1]), 0, ListBuf());
+    Str head = "<thead><tr>" + md_row(md_cells(ls[i]), aligns, "th", 0, base, StrBuf()) + "</tr></thead>";
+    Str rows = md_rows(ls, i + 2, end, aligns, base, StrBuf());
+    return "<table>" + head + "<tbody>" + rows + "</tbody></table>\n";
+}
+
+List(Str) md_aligns(List(Str) cs, Int i, ListBuf(Str) acc) {
+    if (i >= cs.len()) { return acc.finish(); }
+    Str c = str_trim(cs[i]);
+    Bool l = str_starts_with(c, ":");
+    Bool r = str_ends_with(c, ":");
+    Str a = if (l && r) { "center" } else { if (r) { "right" } else { if (l) { "left" } else { "" } } };
+    return md_aligns(cs, i + 1, acc.push(a));
+}
+
+Str md_rows(List(Str) ls, Int i, Int end, List(Str) aligns, Str base, StrBuf b) {
+    if (i >= end) { return b.finish(); }
+    return md_rows(ls, i + 1, end, aligns, base, b.push("<tr>" + md_row(md_cells(ls[i]), aligns, "td", 0, base, StrBuf()) + "</tr>"));
+}
+
+// One row, padded or cut to the header's width.
+Str md_row(List(Str) cs, List(Str) aligns, Str tag, Int i, Str base, StrBuf b) {
+    if (i >= aligns.len()) { return b.finish(); }
+    Str text = if (i < cs.len()) { str_trim(cs[i]) } else { "" };
+    Str style = if (aligns[i] == "") { "" } else { " style=\"text-align:" + aligns[i] + "\"" };
+    return md_row(cs, aligns, tag, i + 1, base, b.push("<" + tag + style + ">" + md_inline(text, base) + "</" + tag + ">"));
+}
+
+// ─── Inline ─────────────────────────────────────────────────────────────
+
+pub Str md_inline(Str s, Str base) { return md_in(s, 0, base, StrBuf()); }
+
+Bool md_punct(Int c) { return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126); }
+
+Bool md_space(Int c) { return c == 32 || c == 10 || c == 2; }
+
+Bool md_alnum(Int c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c > 127; }
+
+Str md_in(Str s, Int i, Str base, StrBuf b) {
+    Int n = str_len(s);
+    if (i >= n) { return b.finish(); }
+    Int c = str_char_at(s, i);
+    Int nx = if (i + 1 < n) { str_char_at(s, i + 1) } else { 0 };
+    if (c == 92 && md_punct(nx)) { return md_in(s, i + 2, base, b.push(md_esc(str_from_code(nx)))); }
+    if (c == 2) { return md_in(s, i + 1, base, b.push("<br>\n")); }
+    if (c == 96) {
+        Int k = md_run(s, i, 96);
+        Str ticks = str_slice(s, i, k);
+        Int close = md_find_run(s, ticks, k);
+        if (close >= 0) {
+            Str code0 = str_replace(str_slice(s, k, close), "\n", " ");
+            Bool pad = str_len(code0) >= 2 && str_starts_with(code0, " ") && str_ends_with(code0, " ") && str_trim(code0) != "";
+            Str code = if (pad) { str_slice(code0, 1, str_len(code0) - 1) } else { code0 };
+            return md_in(s, close + str_len(ticks), base, b.push("<code>" + md_esc(code) + "</code>"));
+        }
+        return md_in(s, k, base, b.push(ticks));
+    }
+    if (c == 33 && nx == 91) {
+        MdLink img = md_link_at(s, i + 1);
+        if (img.ok) {
+            Str alt = md_plain(img.text);
+            Str label = if (alt == "") { "image" } else { alt };
+            Str url = md_url(img.url, base);
+            return md_in(s, img.end, base, b.push("<a class=\"md-img\" href=\"" + ds_escape_attr(url) + "\" rel=\"nofollow noopener\">" + md_esc(label) + "</a>"));
+        }
+    }
+    if (c == 91) {
+        MdLink lk = md_link_at(s, i);
+        if (lk.ok) {
+            Str url = md_url(lk.url, base);
+            Str title = if (lk.title == "") { "" } else { " title=\"" + ds_escape_attr(lk.title) + "\"" };
+            return md_in(s, lk.end, base, b.push("<a href=\"" + ds_escape_attr(url) + "\"" + title + " rel=\"nofollow noopener\">" + md_inline(lk.text, base) + "</a>"));
+        }
+    }
+    if (c == 60) {
+        Int gt = str_index_of(s, ">", i + 1);
+        Str inner = if (gt > i) { str_slice(s, i + 1, gt) } else { "" };
+        Bool auto = gt > i && !str_contains(inner, " ") && (str_starts_with(inner, "http://") || str_starts_with(inner, "https://") || str_starts_with(inner, "mailto:"));
+        Bool mail = gt > i && !str_contains(inner, " ") && !str_contains(inner, ":") && str_contains(inner, "@") && str_contains(inner, ".");
+        if (auto || mail) {
+            Str href = if (mail) { "mailto:" + inner } else { inner };
+            return md_in(s, gt + 1, base, b.push("<a href=\"" + ds_escape_attr(href) + "\" rel=\"nofollow noopener\">" + md_esc(inner) + "</a>"));
+        }
+    }
+    if ((c == 104) && (str_starts_with(str_slice(s, i, n), "https://") || str_starts_with(str_slice(s, i, n), "http://")) && (i == 0 || !md_alnum(str_char_at(s, i - 1)))) {
+        Int e0 = md_url_end(s, i);
+        Int e = md_url_trim(s, i, e0);
+        Str u = str_slice(s, i, e);
+        return md_in(s, e, base, b.push("<a href=\"" + ds_escape_attr(u) + "\" rel=\"nofollow noopener\">" + md_esc(u) + "</a>"));
+    }
+    if ((c == 42 || c == 95) && nx == c) {
+        Str d2 = str_slice(s, i, i + 2);
+        Int close2 = md_close(s, d2, i + 2, c == 95);
+        if (close2 > i + 2 && md_opens(s, i, 2, c == 95)) {
+            return md_in(s, close2 + 2, base, b.push("<strong>" + md_inline(str_slice(s, i + 2, close2), base) + "</strong>"));
+        }
+    }
+    if (c == 126 && nx == 126) {
+        Int close3 = md_close(s, "~~", i + 2, false);
+        if (close3 > i + 2 && md_opens(s, i, 2, false)) {
+            return md_in(s, close3 + 2, base, b.push("<del>" + md_inline(str_slice(s, i + 2, close3), base) + "</del>"));
+        }
+    }
+    if (c == 42 || c == 95) {
+        Str d1 = str_from_code(c);
+        Int close1 = md_close(s, d1, i + 1, c == 95);
+        if (close1 > i + 1 && md_opens(s, i, 1, c == 95)) {
+            return md_in(s, close1 + 1, base, b.push("<em>" + md_inline(str_slice(s, i + 1, close1), base) + "</em>"));
+        }
+    }
+    return md_in(s, i + 1, base, b.push(md_esc(str_from_code(c))));
+}
+
+// Index of the next run of exactly `ticks`, or -1.
+Int md_find_run(Str s, Str ticks, Int from) {
+    Int at = str_index_of(s, ticks, from);
+    if (at < 0) { return -1; }
+    Int k = md_run(s, at, 96);
+    if (k - at == str_len(ticks) && (at == 0 || str_char_at(s, at - 1) != 96)) { return at; }
+    return md_find_run(s, ticks, k);
+}
+
+// Can the delimiter at `i` (`k` long) open: followed by a non-space and,
+// for `_`, not inside a word.
+Bool md_opens(Str s, Int i, Int k, Bool word) {
+    if (i + k >= str_len(s) || md_space(str_char_at(s, i + k))) { return false; }
+    if (word && i > 0 && md_alnum(str_char_at(s, i - 1))) { return false; }
+    return true;
+}
+
+// The next closing `d` after `from`: preceded by a non-space and, for
+// `_`, not followed by a word character. -1 when none.
+Int md_close(Str s, Str d, Int from, Bool word) {
+    Int at = str_index_of(s, d, from);
+    if (at < 0) { return -1; }
+    Bool after_space = md_space(str_char_at(s, at - 1));
+    Int k = str_len(d);
+    Bool glued = word && at + k < str_len(s) && md_alnum(str_char_at(s, at + k));
+    Bool longer = at + k < str_len(s) && str_char_at(s, at + k) == str_char_at(d, 0) && k == 1;
+    if (after_space || glued || at == from) { return md_close(s, d, at + 1, word); }
+    if (longer) { return md_close(s, d, at + 2, word); }
+    return at;
+}
+
+Int md_url_end(Str s, Int i) {
+    if (i >= str_len(s)) { return i; }
+    Int c = str_char_at(s, i);
+    if (c <= 32 || c == 60 || c == 2) { return i; }
+    return md_url_end(s, i + 1);
+}
+
+// Trailing punctuation is the sentence's, not the URL's.
+Int md_url_trim(Str s, Int start, Int e) {
+    if (e <= start) { return e; }
+    Int c = str_char_at(s, e - 1);
+    if (c == 46 || c == 44 || c == 59 || c == 58 || c == 33 || c == 63 || c == 41 || c == 39 || c == 34 || c == 42 || c == 95) { return md_url_trim(s, start, e - 1); }
+    return e;
+}
+
+type MdLink = { Bool ok; Str text; Str url; Str title; Int end; };
+
+MdLink md_no_link() { return MdLink { .ok = false, .text = "", .url = "", .title = "", .end = 0 }; }
+
+// `[text](url "title")` starting at the `[` at `i`.
+MdLink md_link_at(Str s, Int i) {
+    Int close = md_bracket_close(s, i + 1, 0);
+    if (close < 0 || close + 1 >= str_len(s) || str_char_at(s, close + 1) != 40) { return md_no_link(); }
+    Int paren = md_paren_close(s, close + 2, 0);
+    if (paren < 0) { return md_no_link(); }
+    Str inside = str_trim(str_slice(s, close + 2, paren));
+    Int sp = str_index_of(inside, " ", 0);
+    Str url0 = if (sp >= 0) { str_slice(inside, 0, sp) } else { inside };
+    Str rest = if (sp >= 0) { str_trim(str_slice(inside, sp + 1, str_len(inside))) } else { "" };
+    Str url = if (str_starts_with(url0, "<") && str_ends_with(url0, ">")) { str_slice(url0, 1, str_len(url0) - 1) } else { url0 };
+    Bool quoted = str_len(rest) >= 2 && ((str_starts_with(rest, "\"") && str_ends_with(rest, "\"")) || (str_starts_with(rest, "'") && str_ends_with(rest, "'")));
+    Str title = if (quoted) { str_slice(rest, 1, str_len(rest) - 1) } else { "" };
+    if (rest != "" && !quoted) { return md_no_link(); }
+    return MdLink { .ok = true, .text = str_slice(s, i + 1, close), .url = url, .title = title, .end = paren + 1 };
+}
+
+Int md_bracket_close(Str s, Int i, Int depth) {
+    if (i >= str_len(s)) { return -1; }
+    Int c = str_char_at(s, i);
+    if (c == 92) { return md_bracket_close(s, i + 2, depth); }
+    if (c == 96) {
+        Int k = md_run(s, i, 96);
+        Int close = md_find_run(s, str_slice(s, i, k), k);
+        return md_bracket_close(s, if (close >= 0) { close + (k - i) } else { k }, depth);
+    }
+    if (c == 91) { return md_bracket_close(s, i + 1, depth + 1); }
+    if (c == 93) { return if (depth == 0) { i } else { md_bracket_close(s, i + 1, depth - 1) }; }
+    return md_bracket_close(s, i + 1, depth);
+}
+
+Int md_paren_close(Str s, Int i, Int depth) {
+    if (i >= str_len(s)) { return -1; }
+    Int c = str_char_at(s, i);
+    if (c == 92) { return md_paren_close(s, i + 2, depth); }
+    if (c == 40) { return md_paren_close(s, i + 1, depth + 1); }
+    if (c == 41) { return if (depth == 0) { i } else { md_paren_close(s, i + 1, depth - 1) }; }
+    if (c == 10) { return -1; }
+    return md_paren_close(s, i + 1, depth);
+}
+
+// A URL kept only if it cannot run script: http(s), mailto, an anchor,
+// or a path; a relative path is resolved against `base`.
+pub Str md_url(Str url0, Str base) {
+    Str url = str_trim(url0);
+    Str low = str_to_lower(url);
+    if (str_starts_with(low, "http://") || str_starts_with(low, "https://") || str_starts_with(low, "mailto:")) { return url; }
+    if (str_starts_with(url, "#") || str_starts_with(url, "/")) { return url; }
+    Int colon = str_index_of(url, ":", 0);
+    Int slash = str_index_of(url, "/", 0);
+    Bool scheme = colon >= 0 && (slash < 0 || colon < slash);
+    if (scheme || url == "") { return "#"; }
+    Str rel = if (str_starts_with(url, "./")) { str_slice(url, 2, str_len(url)) } else { url };
+    return base + rel;
+}
+
+// Inline markup as plain text (for an image's alt).
+Str md_plain(Str s) {
+    return str_replace(str_replace(str_replace(str_replace(s, "*", ""), "_", ""), "`", ""), "~~", "");
+}

@@ -89,14 +89,39 @@ async function main() {
     report("publish appears live", await until(`${names}.includes('fresh-pkg')`, 8000), await evaluate(names));
     report("page was not reloaded", await evaluate("performance.getEntriesByType('navigation').length === 1 && document.querySelector('input[type=search]') !== null"));
 
-    await open("/pkg/resid-json");
-    report("detail loads", await until("document.querySelector('#detail').textContent.includes('hash matches')"));
-    report("signature verified", await until("document.querySelector('#detail').textContent.includes('signature verified')"));
-    report("manifest shown", await until("document.querySelector('#viewer pre')?.textContent.includes('name = \"resid-json\"')"));
-    await evaluate("[...document.querySelectorAll('#detail button')].find(b => b.textContent === 'src/lex.resid').click()");
-    report("file opens", await until("document.querySelector('#viewer h2')?.textContent === 'src/lex.resid'"));
-    report("file escaped", await evaluate("document.querySelector('#viewer pre').children.length === 0"));
+    // A package: its readme, then each tab, a file, another version.
+    const panel = "document.querySelector('#panel').textContent";
+    const tab = (label) => evaluate(`[...document.querySelectorAll('nav.tabs button')].find(b => b.textContent === '${label}').click()`);
+    await open("/pkg/web");
+    report("package readme", await until(`${panel}.includes('Now serves files.')`));
     report("live on package page", await until(live));
+    await tab("Files");
+    report("files tab", await until("document.querySelector('#viewer') !== null"));
+    report("tab marked active", await until("document.querySelector('nav.tabs button.active')?.textContent === 'Files'"));
+    report("url follows the tab", await until("location.search.includes('tab=files')"));
+    await evaluate("[...document.querySelectorAll('#panel button')].find(b => b.textContent === 'src/web.resid').click()");
+    report("file opens", await until("document.querySelector('#viewer h3 code')?.textContent === 'src/web.resid'"));
+    report("file escaped", await evaluate("document.querySelector('#viewer pre').children.length === 0"));
+    report("url names the file", await until("location.search.includes('file=src/web.resid')"));
+    await tab("Manifest");
+    report("manifest tab", await until(`${panel}.includes('The most this package')`));
+    await tab("Dependencies");
+    report("dependencies tab", await until(`${panel}.includes('Used by')`));
+    report("cycle shown", await evaluate("document.querySelector('#panel .badge.bad')?.textContent === 'cycle'"));
+    await tab("Diff");
+    report("diff tab", await until(`${panel}.includes('Gains')`));
+    report("diff lines", await until("document.querySelectorAll('#panel tr.add').length > 0 && document.querySelectorAll('#panel tr.del').length > 0"));
+    await evaluate("(() => { const s = document.querySelector('#bar select'); s.value = '1.0.0'; s.dispatchEvent(new Event('change', { bubbles: true })); })()");
+    report("version switch", await until("document.querySelector('#title code')?.textContent === '1.0.0'"));
+    report("older version marked", await until("document.querySelector('#summary').textContent.includes('newer: 1.1.0')"));
+    await tab("Readme");
+    report("older readme", await until(`${panel}.includes('framework. See the licence')`));
+    report("readme script stays text", await evaluate("[...document.querySelectorAll('#panel script')].length === 0 && document.querySelector('#panel').textContent.includes('<script>alert(1)</script>')"));
+    await evaluate("[...document.querySelectorAll('#panel a')].find(a => a.textContent === 'the licence').click()");
+    report("readme link opens the file", await until("document.querySelector('#viewer pre')?.textContent.includes('MIT licence text')"));
+
+    await open("/pkg/resid-json");
+    report("signature verified", await until("document.querySelector('#summary').textContent.includes('signature verified')"));
 
     ws.close();
 }

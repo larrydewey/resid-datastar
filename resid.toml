@@ -16,3 +16,7 @@ path = "../resid-json"
 
 [dependencies.resid-serial]
 path = "../resid-serial"
+
+# The registry UI reads manifests through resid-toml.
+[dependencies.resid-toml]
+path = "../resid-toml"

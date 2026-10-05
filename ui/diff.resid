@@ -1,0 +1,155 @@
+// ─── ui/diff.resid — line diffs ────────────────────────────────────────
+// Myers' O(ND) algorithm over lines: the shortest edit script between
+// two texts, and its hunks with context. A pair too different to be
+// worth a line diff (more than `max_d` edits) says so instead of
+// spending the time.
+
+type DiffOp = { Int kind; Str line; Int a; Int b; };   // kind 0 same, 1 removed, 2 added; a/b 1-based, 0 when none
+
+type Diff = { Bool ok; List(DiffOp) ops; Int added; Int removed; };
+
+pub List(Str) diff_lines(Str text) {
+    if (text == "") { return []; }
+    List(Str) ls = str_split(str_replace(text, "\r\n", "\n"), "\n");
+    return if (ls.len() > 0 && ls[ls.len() - 1] == "") { ls[0..(ls.len() - 1)] } else { ls };
+}
+
+pub Diff diff_texts(Str a, Str b, Int max_d) { return diff_of(diff_lines(a), diff_lines(b), max_d); }
+
+pub Diff diff_of(List(Str) a, List(Str) b, Int max_d) {
+    // The common prefix and suffix need no search.
+    Int pre = common_prefix(a, b, 0);
+    Int suf = common_suffix(a, b, pre, 0);
+    List(Str) a2 = a[pre..(a.len() - suf)];
+    List(Str) b2 = b[pre..(b.len() - suf)];
+    Map(Int, Int) v0 = {};
+    List(Map(Int, Int)) none = [];
+    Trace t = myers(a2, b2, 0, v0.insert(1, 0), none, max_d);
+    if (!t.ok) { return Diff { .ok = false, .ops = [], .added = 0, .removed = 0 }; }
+    List(DiffOp) mid = backtrack(a2, b2, t.vs, t.vs.len() - 1, a2.len(), b2.len(), []);
+    List(DiffOp) head = same_run(a, 0, pre, 0, ListBuf());
+    List(DiffOp) tail = same_run(a, a.len() - suf, a.len(), b.len() - suf - (a.len() - suf), ListBuf());
+    List(DiffOp) ops = head.concat(renumber(mid, pre, 0, ListBuf())).concat(tail);
+    return Diff { .ok = true, .ops = ops, .added = count_kind(ops, 2, 0, 0), .removed = count_kind(ops, 1, 0, 0) };
+}
+
+Int common_prefix(List(Str) a, List(Str) b, Int i) {
+    if (i >= a.len() || i >= b.len() || a[i] != b[i]) { return i; }
+    return common_prefix(a, b, i + 1);
+}
+
+Int common_suffix(List(Str) a, List(Str) b, Int pre, Int k) {
+    Int ia = a.len() - 1 - k;
+    Int ib = b.len() - 1 - k;
+    if (ia < pre || ib < pre || a[ia] != b[ib]) { return k; }
+    return common_suffix(a, b, pre, k + 1);
+}
+
+// Unchanged lines a[from..to), with b's numbers `shift` away from a's.
+List(DiffOp) same_run(List(Str) a, Int from, Int to, Int shift, ListBuf(DiffOp) acc) {
+    if (from >= to) { return acc.finish(); }
+    return same_run(a, from + 1, to, shift, acc.push(DiffOp { .kind = 0, .line = a[from], .a = from + 1, .b = from + 1 + shift }));
+}
+
+List(DiffOp) renumber(List(DiffOp) ops, Int pre, Int i, ListBuf(DiffOp) acc) {
+    if (i >= ops.len()) { return acc.finish(); }
+    DiffOp o = ops[i];
+    DiffOp moved = DiffOp { .kind = o.kind, .line = o.line, .a = if (o.a > 0) { o.a + pre } else { 0 }, .b = if (o.b > 0) { o.b + pre } else { 0 } };
+    return renumber(ops, pre, i + 1, acc.push(moved));
+}
+
+Int count_kind(List(DiffOp) ops, Int kind, Int i, Int n) {
+    if (i >= ops.len()) { return n; }
+    return count_kind(ops, kind, i + 1, if (ops[i].kind == kind) { n + 1 } else { n });
+}
+
+// The furthest-reaching paths for each edit count, kept for backtracking.
+type Trace = { Bool ok; List(Map(Int, Int)) vs; };
+
+Trace myers(List(Str) a, List(Str) b, Int d, Map(Int, Int) v, List(Map(Int, Int)) vs, Int max_d) {
+    if (d > max_d) { return Trace { .ok = false, .vs = vs }; }
+    Step s = diagonals(a, b, d, -d, v);
+    List(Map(Int, Int)) kept = vs.concat([s.v]);
+    if (s.done) { return Trace { .ok = true, .vs = kept }; }
+    return myers(a, b, d + 1, s.v, kept, max_d);
+}
+
+type Step = { Map(Int, Int) v; Bool done; };
+
+Step diagonals(List(Str) a, List(Str) b, Int d, Int k, Map(Int, Int) v) {
+    if (k > d) { return Step { .v = v, .done = false }; }
+    Int down = v.get(k + 1) else { 0 };
+    Int right = v.get(k - 1) else { 0 };
+    Int x0 = if (k == -d || (k != d && right < down)) { down } else { right + 1 };
+    Int x = snake(a, b, x0, x0 - k);
+    Map(Int, Int) v2 = v.insert(k, x);
+    if (x >= a.len() && x - k >= b.len()) { return Step { .v = v2, .done = true }; }
+    return diagonals(a, b, d, k + 2, v2);
+}
+
+Int snake(List(Str) a, List(Str) b, Int x, Int y) {
+    if (x < a.len() && y < b.len() && y >= 0 && a[x] == b[y]) { return snake(a, b, x + 1, y + 1); }
+    return x;
+}
+
+// Walk the trace back from the end, prepending each step's diagonal run
+// and its one edit.
+List(DiffOp) backtrack(List(Str) a, List(Str) b, List(Map(Int, Int)) vs, Int d, Int x, Int y, List(DiffOp) acc) {
+    if (d < 0) { return acc; }
+    if (d == 0) { return diag(a, 0, x, y - x, acc); }
+    Map(Int, Int) v = vs[d - 1];
+    Int k = x - y;
+    Int down = v.get(k + 1) else { 0 };
+    Int right = v.get(k - 1) else { 0 };
+    Bool went_down = k == -d || (k != d && right < down);
+    Int pk = if (went_down) { k + 1 } else { k - 1 };
+    Int px = v.get(pk) else { 0 };
+    Int py = px - pk;
+    // After the edit the path stood at (sx, sy), then ran the diagonal.
+    Int sx = if (went_down) { px } else { px + 1 };
+    Int sy = sx - k;
+    List(DiffOp) run = diag(a, sx, x, sy - sx, acc);
+    DiffOp edit = if (went_down) { DiffOp { .kind = 2, .line = b[py], .a = 0, .b = py + 1 } } else { DiffOp { .kind = 1, .line = a[px], .a = px + 1, .b = 0 } };
+    return backtrack(a, b, vs, d - 1, px, py, [edit].concat(run));
+}
+
+// Unchanged lines a[from..to) ahead of `acc`.
+List(DiffOp) diag(List(Str) a, Int from, Int to, Int shift, List(DiffOp) acc) {
+    List(DiffOp) run = same_run(a, from, to, shift, ListBuf());
+    return run.concat(acc);
+}
+
+// ─── Hunks ──────────────────────────────────────────────────────────────
+
+type Hunk = { Int from; Int to; };   // ops[from..to)
+
+// The changed stretches with `ctx` unchanged lines around each, merged
+// when they touch.
+pub List(Hunk) diff_hunks(List(DiffOp) ops, Int ctx) { return hunks_at(ops, ctx, 0, ListBuf()); }
+
+List(Hunk) hunks_at(List(DiffOp) ops, Int ctx, Int i, ListBuf(Hunk) acc) {
+    Int start = next_change(ops, i);
+    if (start >= ops.len()) { return acc.finish(); }
+    Int end = hunk_end(ops, ctx, start);
+    Int from = if (start - ctx > i) { start - ctx } else { i };
+    Int to = if (end + ctx < ops.len()) { end + ctx } else { ops.len() };
+    return hunks_at(ops, ctx, to, acc.push(Hunk { .from = from, .to = to }));
+}
+
+Int next_change(List(DiffOp) ops, Int i) {
+    if (i >= ops.len() || ops[i].kind != 0) { return i; }
+    return next_change(ops, i + 1);
+}
+
+// Past the last change reachable with gaps of at most 2*ctx unchanged lines.
+Int hunk_end(List(DiffOp) ops, Int ctx, Int i) {
+    Int same_to = next_change(ops, change_end(ops, i));
+    Int after = change_end(ops, i);
+    if (same_to < ops.len() && same_to - after <= 2 * ctx) { return hunk_end(ops, ctx, same_to); }
+    return after;
+}
+
+Int change_end(List(DiffOp) ops, Int i) {
+    if (i >= ops.len() || ops[i].kind == 0) { return i; }
+    return change_end(ops, i + 1);
+}

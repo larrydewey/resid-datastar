@@ -1,0 +1,27 @@
+ok heading
+ok setext
+ok paragraphs
+ok hard break
+ok emphasis
+ok code span
+ok fenced
+ok fence unclosed
+ok indented code
+ok bullets
+ok ordered
+ok loose list
+ok tasks
+ok quote
+ok rule
+ok table
+ok link
+ok relative link
+ok script url refused
+ok image as link
+ok autolinks
+ok raw html is text
+ok attribute breakout
+ok escapes
+ok unmatched
+ok crlf and tabs
+exit 0

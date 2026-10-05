@@ -1,0 +1,162 @@
+// ─── ui/manifest.resid — what a package's resid.toml says ──────────────
+// Read through resid-toml into a Value tree, then into the parts the UI
+// shows: the [package] fields, the [capabilities] grant, and each
+// [dependencies.<name>] with its version or path, pinned key and
+// capability ceiling.
+
+import "../src/datastar.resid";
+import "../../resid-toml/src/toml.resid";
+import "../../resid-serial/src/value.resid";
+
+// One dependency. `version` names a registry release, `path` local
+// source; `caps` is the ceiling it runs under, when `has_caps`.
+type Dep = { Str name; Str version; Str path; Str pubkey; Bool has_caps; List(Str) caps; };
+
+// A [package] key and its value as text.
+type MField = { Str key; Str value; };
+
+type Manifest = {
+    Bool ok; Str error;
+    Str name; Str version;
+    List(MField) fields;
+    Bool has_grant; List(Str) grant;
+    List(Dep) deps;
+    Bool require_signatures;
+};
+
+pub Manifest manifest_none(Str why) {
+    return Manifest { .ok = false, .error = why, .name = "", .version = "", .fields = [], .has_grant = false, .grant = [], .deps = [], .require_signatures = false };
+}
+
+pub Manifest manifest_of(Str text) {
+    Result(Value, SerialError) got = from_toml(text);
+    return match got {
+        Ok(v) => manifest_from(v),
+        Err(e) => manifest_none("resid.toml does not parse: " + error_text(e))
+    };
+}
+
+Manifest manifest_from(Value v) {
+    Option(Value) pkg = value_field(v, "package");
+    List(MField) fields = match pkg { Some(p) => mf_fields(p), None => [] };
+    Option(Value) caps = ds_signal(v, "capabilities.grant");
+    Bool has_grant = match caps { Some(x) => true, None => false };
+    List(Str) grant = match caps { Some(x) => mf_strs(x), None => [] };
+    Option(Value) deps = value_field(v, "dependencies");
+    List(Dep) ds = match deps { Some(d) => mf_deps(d), None => [] };
+    return Manifest {
+        .ok = true, .error = "",
+        .name = ds_signal_text(v, "package.name"), .version = ds_signal_text(v, "package.version"),
+        .fields = fields, .has_grant = has_grant, .grant = grant, .deps = ds,
+        .require_signatures = ds_signal_bool(v, "signing.require_signatures")
+    };
+}
+
+// A table's entries in order, whether it came back as a map or a struct.
+type MEntry = { Str key; Value val; };
+
+List(MEntry) mf_entries(Value v) {
+    return match v {
+        VMap(es) => mf_map_entries(es, 0, ListBuf()),
+        VStruct(r) => mf_struct_entries(r.fields, 0, ListBuf()),
+        _ => []
+    };
+}
+
+List(MEntry) mf_map_entries(List(VEntry) es, Int i, ListBuf(MEntry) acc) {
+    if (i >= es.len()) { return acc.finish(); }
+    return mf_map_entries(es, i + 1, acc.push(MEntry { .key = ds_value_text(es[i].key), .val = es[i].val }));
+}
+
+List(MEntry) mf_struct_entries(List(VField) fs, Int i, ListBuf(MEntry) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    return mf_struct_entries(fs, i + 1, acc.push(MEntry { .key = fs[i].name, .val = fs[i].val }));
+}
+
+List(MField) mf_fields(Value p) { return mf_field_list(mf_entries(p), 0, ListBuf()); }
+
+List(MField) mf_field_list(List(MEntry) es, Int i, ListBuf(MField) acc) {
+    if (i >= es.len()) { return acc.finish(); }
+    Value v = es[i].val;
+    Str text = match v { VSeq(xs) => str_join(mf_strs(v), ", "), _ => ds_value_text(v) };
+    return mf_field_list(es, i + 1, acc.push(MField { .key = es[i].key, .value = text }));
+}
+
+// A list of strings (anything else in it is shown as JSON).
+List(Str) mf_strs(Value v) {
+    return match v { VSeq(xs) => mf_strs_at(xs, 0, ListBuf()), _ => [] };
+}
+
+List(Str) mf_strs_at(List(Value) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return mf_strs_at(xs, i + 1, acc.push(ds_value_text(xs[i])));
+}
+
+List(Dep) mf_deps(Value d) { return mf_dep_list(mf_entries(d), 0, ListBuf()); }
+
+List(Dep) mf_dep_list(List(MEntry) es, Int i, ListBuf(Dep) acc) {
+    if (i >= es.len()) { return acc.finish(); }
+    Value t = es[i].val;
+    Option(Value) caps = value_field(t, "capabilities");
+    Dep dep = Dep {
+        .name = es[i].key,
+        // `name = "1.0"` is a version too.
+        .version = match t { VStr(s) => s, _ => ds_signal_text(t, "version") },
+        .path = ds_signal_text(t, "path"), .pubkey = ds_signal_text(t, "pubkey"),
+        .has_caps = match caps { Some(x) => true, None => false },
+        .caps = match caps { Some(x) => mf_strs(x), None => [] }
+    };
+    return mf_dep_list(es, i + 1, acc.push(dep));
+}
+
+// A [package] field by key, "" when absent.
+pub Str mf_field(Manifest m, Str key) { return mf_field_at(m.fields, key, 0); }
+
+Str mf_field_at(List(MField) fs, Str key, Int i) {
+    if (i >= fs.len()) { return ""; }
+    if (fs[i].key == key) { return fs[i].value; }
+    return mf_field_at(fs, key, i + 1);
+}
+
+// ─── Capabilities ───────────────────────────────────────────────────────
+
+// "network(readonly)" is the family "network", mode "readonly"; a bare
+// family is its full grant.
+pub Str cap_family(Str c) {
+    Int p = str_index_of(c, "(", 0);
+    return str_trim(if (p >= 0) { str_slice(c, 0, p) } else { c });
+}
+
+pub Str cap_mode(Str c) {
+    Int p = str_index_of(c, "(", 0);
+    Int q = str_index_of(c, ")", 0);
+    return if (p >= 0 && q > p) { str_trim(str_slice(c, p + 1, q)) } else { "" };
+}
+
+// Does a grant reach outside the program: a family with no read-only
+// mode, or one of the families that can only act?
+pub Bool cap_writes(Str c) {
+    Str f = cap_family(c);
+    Str m = cap_mode(c);
+    if (m == "readonly") { return false; }
+    return f == "filesystem" || f == "network" || f == "process" || f == "environment" || f == "terminal" || f == "clock" || f == "_";
+}
+
+// The grant as badges: read-only grants plain, the rest marked.
+pub Str cap_badges(List(Str) grant) {
+    if (grant.len() == 0) { return "<span class=\"badge good\">no capabilities</span>"; }
+    return cap_badges_at(grant, 0, StrBuf());
+}
+
+Str cap_badges_at(List(Str) gs, Int i, StrBuf b) {
+    if (i >= gs.len()) { return b.finish(); }
+    Str kind = if (cap_writes(gs[i])) { "warn" } else { "plain" };
+    Str sep = if (i == 0) { "" } else { " " };
+    return cap_badges_at(gs, i + 1, b.push(sep + "<span class=\"badge cap " + kind + "\" title=\"capability\">" + ds_escape_html(gs[i]) + "</span>"));
+}
+
+// The [dependencies] entry for depending on `name` at `version`.
+pub Str dep_snippet(Str name, Str version, Str pubkey) {
+    Str key = if (pubkey == "") { "" } else { "\npubkey = \"" + pubkey + "\"" };
+    return "[dependencies." + name + "]\nversion = \"" + version + "\"" + key;
+}

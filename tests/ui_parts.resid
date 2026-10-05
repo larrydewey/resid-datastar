@@ -1,0 +1,75 @@
+// The registry UI's parts: manifests read through resid-toml, capability
+// classes, and line diffs with their hunks.
+import "../ui/manifest.resid";
+import "../ui/diff.resid";
+import "check.resid";
+
+Str ops_text(List(DiffOp) ops, Int i, StrBuf b) {
+    if (i >= ops.len()) { return b.finish(); }
+    Str mark = if (ops[i].kind == 0) { " " } else { if (ops[i].kind == 1) { "-" } else { "+" } };
+    return ops_text(ops, i + 1, b.push(f"{mark}{ops[i].a}:{ops[i].b}:" + ops[i].line + "|"));
+}
+
+Str diffed(Str a, Str b) {
+    Diff d = diff_texts(a, b, 1000);
+    return if (d.ok) { ops_text(d.ops, 0, StrBuf()) + f" +{d.added} -{d.removed}" } else { "too different" };
+}
+
+Str hunks(Str a, Str b, Int ctx) {
+    List(Hunk) hs = diff_hunks(diff_texts(a, b, 1000).ops, ctx);
+    return hunk_text(hs, 0, StrBuf());
+}
+
+Str hunk_text(List(Hunk) hs, Int i, StrBuf b) {
+    if (i >= hs.len()) { return b.finish(); }
+    return hunk_text(hs, i + 1, b.push(f"[{hs[i].from},{hs[i].to})"));
+}
+
+Str dep_text(List(Dep) ds, Int i, StrBuf b) {
+    if (i >= ds.len()) { return b.finish(); }
+    Dep d = ds[i];
+    Str caps = if (d.has_caps) { "[" + str_join(d.caps, ",") + "]" } else { "-" };
+    return dep_text(ds, i + 1, b.push(d.name + " v=" + d.version + " p=" + d.path + " k=" + d.pubkey + " c=" + caps + ";"));
+}
+
+Int main() {
+    Str toml = "[package]\nname = \"web\"\nversion = \"2.1.0\"\ndescription = \"A server\"\nlicense = \"MIT\"\nauthors = [\"A\", \"B\"]\n\n[capabilities]\ngrant = [\"network(readonly)\", \"filesystem\"]\n\n[dependencies.resid-json]\nversion = \"0.1.0\"\npubkey = \"ab\"\ncapabilities = []\n\n[dependencies]\nlocal = { path = \"../local\" }\nshort = \"1.2\"\n\n[signing]\nrequire_signatures = true\n";
+    Manifest m = manifest_of(toml);
+    Manifest bad = manifest_of("[package\nname=");
+    Manifest bare = manifest_of("[package]\nname = \"x\"\nversion = \"1\"\n");
+    List(Bool) r = [
+        check("manifest ok", m.ok, true),
+        check("name version", m.name + " " + m.version, "web 2.1.0"),
+        check("fields", mf_field(m, "description") + "|" + mf_field(m, "license") + "|" + mf_field(m, "authors"), "A server|MIT|A, B"),
+        check("grant", str_join(m.grant, ","), "network(readonly),filesystem"),
+        check("deps", dep_text(m.deps, 0, StrBuf()), "resid-json v=0.1.0 p= k=ab c=[];local v= p=../local k= c=-;short v=1.2 p= k= c=-;"),
+        check("signing", m.require_signatures, true),
+        check("bad toml", bad.ok, false),
+        check("bad toml says why", str_starts_with(bad.error, "resid.toml does not parse"), true),
+        check("no grant", bare.has_grant, false),
+        check("cap parts", cap_family("network(readonly)") + "/" + cap_mode("network(readonly)") + "/" + cap_mode("process"), "network/readonly/"),
+        check("cap writes", f"{cap_writes("filesystem")} {cap_writes("filesystem(readonly)")} {cap_writes("args")} {cap_writes("network")}", "true false false true"),
+        check("cap badges", cap_badges(["args", "process"]), "<span class=\"badge cap plain\" title=\"capability\">args</span> <span class=\"badge cap warn\" title=\"capability\">process</span>"),
+        check("cap none", cap_badges([]), "<span class=\"badge good\">no capabilities</span>"),
+        check("snippet", dep_snippet("web", "2.1.0", "k"), "[dependencies.web]\nversion = \"2.1.0\"\npubkey = \"k\""),
+        check("diff same", diffed("a\nb\n", "a\nb\n"), " 1:1:a| 2:2:b| +0 -0"),
+        check("diff change", diffed("a\nb\nc", "a\nB\nc"), " 1:1:a|-2:0:b|+0:2:B| 3:3:c| +1 -1"),
+        check("diff insert", diffed("a\nc", "a\nb\nc\nd"), " 1:1:a|+0:2:b| 2:3:c|+0:4:d| +2 -0"),
+        check("diff delete", diffed("x\na\ny\nb", "a\nb"), "-1:0:x| 2:1:a|-3:0:y| 4:2:b| +0 -2"),
+        check("diff from empty", diffed("", "a\nb"), "+0:1:a|+0:2:b| +2 -0"),
+        check("diff to empty", diffed("a", ""), "-1:0:a| +0 -1"),
+        check("diff interleaved", diffed("a\nb\nc\na\nb\nb\na", "c\nb\na\nb\na\nc"), diffed("a\nb\nc\na\nb\nb\na", "c\nb\na\nb\na\nc")),
+        check("diff too different", diff_texts("a\nb\nc\nd", "w\nx\ny\nz", 3).ok, false),
+        check("hunks apart", hunks("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12", "1\nX\n3\n4\n5\n6\n7\n8\n9\n10\nY\n12", 1), "[0,4)[10,14)"),
+        check("hunks merge", hunks("1\n2\n3\n4\n5", "1\nX\n3\nY\n5", 1), "[0,7)"),
+        check("hunks none", hunks("a", "a", 3), "")
+    ];
+    return status(r, 0) + edit_count_check();
+}
+
+// The script's length is minimal on a classic case (D = 5).
+Int edit_count_check() {
+    Diff d = diff_texts("a\nb\nc\na\nb\nb\na", "c\nb\na\nb\na\nc", 100);
+    Bool ok = check("diff minimal", d.added + d.removed, 5);
+    return if (ok) { 0 } else { 1 };
+}

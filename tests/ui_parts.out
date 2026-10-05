@@ -1,0 +1,27 @@
+ok manifest ok
+ok name version
+ok fields
+ok grant
+ok deps
+ok signing
+ok bad toml
+ok bad toml says why
+ok no grant
+ok cap parts
+ok cap writes
+ok cap badges
+ok cap none
+ok snippet
+ok diff same
+ok diff change
+ok diff insert
+ok diff delete
+ok diff from empty
+ok diff to empty
+ok diff interleaved
+ok diff too different
+ok hunks apart
+ok hunks merge
+ok hunks none
+ok diff minimal
+exit 0
