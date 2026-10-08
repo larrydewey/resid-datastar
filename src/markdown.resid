@@ -1,0 +1,12 @@
+// src/markdown.resid — the package's Markdown renderer, at the root.
+//
+// The renderer itself lives in ui/markdown.resid (the registry UI is where
+// it was written and tested). This module puts it beside src/datastar.resid
+// so a package that depends on resid-datastar can import it by name:
+//
+//     import "resid-datastar/markdown.resid";
+//
+// the depmap names this package's root (src/datastar.resid) and its other
+// modules sit beside that root, so the name resolves here.
+
+import "../ui/markdown.resid";
